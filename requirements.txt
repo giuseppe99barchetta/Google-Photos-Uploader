@@ -1,0 +1,13 @@
+bbpb==1.4.2
+certifi==2025.4.26
+charset-normalizer==3.4.2
+gpmc @ https://github.com/xob0t/google_photos_mobile_client/archive/refs/heads/main.zip#sha256=34c6ae6f0544df5d70fb0c72d6a137545d6e183d422e6c3ed06379ef4754e6ca
+idna==3.10
+markdown-it-py==3.0.0
+mdurl==0.1.2
+Pygments==2.19.1
+requests==2.32.4
+rich==14.0.0
+six==1.17.0
+urllib3==2.4.0
+watchdog==6.0.0

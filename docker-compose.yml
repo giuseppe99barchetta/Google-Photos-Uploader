@@ -1,0 +1,12 @@
+services:
+  gphotos-uploader:
+    image: ciuse99/gphotos-uploader:latest
+    container_name: gphotos-uploader
+    restart: unless-stopped
+    environment:
+      - WATCHED_FOLDER=/data
+      - AUTH_DATA=INSERT_YOUR_AUTH_DATA_HERE
+    volumes:
+      - INSERT_YOUR_PHOTO_FOLDER_HERE:/data
+    # If necessary, specify the UID/GID of the user for file permissions
+    # user: "1000:1000"
