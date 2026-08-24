@@ -11,7 +11,7 @@ client = Client(auth_data=AUTH_DATA)
 
 class PhotoHandler(FileSystemEventHandler):
     def on_created(self, event):
-        if not event.is_directory and event.src_path.lower().endswith(('.jpg', '.jpeg', '.png', '.heic', '.mp4')):
+        if not event.is_directory and event.src_path.lower().endswith(('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.mov')):
             print(f"Found new file: {event.src_path}")
             try:
                 # File upload
