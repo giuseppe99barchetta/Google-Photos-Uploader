@@ -1,6 +1,6 @@
 # 📷 Google Photos Uploader
 
-This project is based on [google_photos_mobile_client](https://github.com/xob0t/google_photos_mobile_client) and allows you to **monitor a folder** (even SMB/NAS shares) and **automatically upload photos to Google Photos** without consuming storage space, using a lightweight Docker container.
+This project is based on [GPMC](https://github.com/xob0t/gpmc) and allows you to **monitor a folder** (even SMB/NAS shares) and **automatically upload photos and videos to Google Photos** without consuming storage space, using a lightweight Docker container.
 
 ---
 
@@ -8,6 +8,7 @@ This project is based on [google_photos_mobile_client](https://github.com/xob0t/
 
 - ✅ Unlimited uploads in original quality  
 - 🔁 Automatically skips already uploaded files  
+- 🎞️ Supports JPG, JPEG, PNG, HEIC, MP4, and MOV files
 - 📁 Works with local folders and SMB/NAS mounts  
 - 🐳 Runs inside a minimal Docker container  
 
@@ -48,19 +49,19 @@ Replace `INSERT_YOUR_AUTH_DATA_HERE` with your real authentication string. Set `
 2. Start the container in the background:
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 3. View live logs:
 
 ```bash
-docker-compose logs -f
+docker compose logs -f
 ```
 
 4. Stop the container:
 
 ```bash
-docker-compose down
+docker compose down
 ```
 
 ---
@@ -129,8 +130,8 @@ You only need to do this **once** to retrieve your permanent key.
 To update the image from GitHub Container Registry and restart the container:
 
 ```bash
-docker-compose pull
-docker-compose up -d --force-recreate
+docker compose pull
+docker compose up -d --force-recreate
 ```
 
 ---
@@ -139,6 +140,6 @@ docker-compose up -d --force-recreate
 
 - You can change the monitored folder at any time by updating the volume bind and the `WATCHED_FOLDER` variable.
 - If you encounter permission issues with SMB shares, ensure the container user has the correct access rights.
-- Based on the open-source project [google_photos_mobile_client](https://github.com/xob0t/google_photos_mobile_client), with a simplified Docker integration.
+- Based on the open-source project [GPMC](https://github.com/xob0t/gpmc), with a simplified Docker integration.
 
 ---
