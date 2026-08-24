@@ -28,17 +28,17 @@ Here's a sample `docker-compose.yml` configuration:
 ```yaml
 services:
   gphotos-uploader:
-    image: ciuse99/gphotos-uploader:latest
+    image: ghcr.io/giuseppe99barchetta/google-photos-uploader:latest
     container_name: gphotos-uploader
     restart: unless-stopped
     environment:
       - WATCHED_FOLDER=/data
       - AUTH_DATA=INSERT_YOUR_AUTH_DATA_HERE
     volumes:
-      - INSERT_YOUR_PHOTO_FOLDER_HERE:/data
+      - ${PHOTO_FOLDER:-./photos}:/data
 ```
 
-Replace `INSERT_YOUR_AUTH_DATA_HERE` with your real authentication string, and map your photo folder accordingly.
+Replace `INSERT_YOUR_AUTH_DATA_HERE` with your real authentication string. Set `PHOTO_FOLDER` to the folder to monitor; it defaults to `./photos`.
 
 ---
 
@@ -126,7 +126,7 @@ You only need to do this **once** to retrieve your permanent key.
 
 ## 🔄 Updating the Image
 
-To update the image from Docker Hub and restart the container:
+To update the image from GitHub Container Registry and restart the container:
 
 ```bash
 docker-compose pull
