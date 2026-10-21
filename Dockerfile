@@ -12,7 +12,7 @@ RUN apk add --no-cache \
     cifs-utils
 
 COPY requirements.txt .
-RUN pip install --user --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # Stage 2: Final image
 FROM python:3.11-alpine
@@ -22,9 +22,8 @@ RUN apk add --no-cache \
     cifs-utils \
     inotify-tools
 
-# Copy dependencies from the build stage
-COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
+# Copy dependencies from the build stage into a location readable by appuser
+COPY --from=builder /install /usr/local
 
 # Configure non-root user
 RUN adduser -D -u 1000 appuser && \
