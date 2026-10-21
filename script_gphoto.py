@@ -1,5 +1,5 @@
-import os
 import json
+import os
 import stat
 import sys
 import time
@@ -11,7 +11,6 @@ from watchdog.observers.polling import PollingObserver as Observer
 
 from upload_state import StateStore
 from uploader_config import Config
-
 
 MEDIA_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.mov')
 

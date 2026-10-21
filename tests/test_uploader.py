@@ -7,8 +7,14 @@ from unittest.mock import Mock
 from watchdog.events import FileCreatedEvent, FileMovedEvent
 
 from script_gphoto import (
-    FileChangedError, FileProcessor, PhotoHandler, discover_files,
-    upload_file as real_upload_file, wait_until_stable,
+    FileChangedError,
+    FileProcessor,
+    PhotoHandler,
+    discover_files,
+    wait_until_stable,
+)
+from script_gphoto import (
+    upload_file as real_upload_file,
 )
 from upload_state import StateStore
 

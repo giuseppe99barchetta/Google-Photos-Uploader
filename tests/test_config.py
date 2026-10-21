@@ -5,7 +5,6 @@ from urllib.parse import urlencode
 
 from uploader_config import Config
 
-
 FAKE_AUTH = urlencode({
     'androidId': 'test-device', 'client_sig': 'test-signature',
     'callerSig': 'test-signature', 'device_country': 'it',
