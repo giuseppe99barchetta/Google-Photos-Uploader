@@ -49,6 +49,26 @@ class DurableQueueTests(unittest.TestCase):
         self.processor.process_once()
         self.assertEqual(self.store.get(self.path)['status'], 'done')
 
+    def test_retry_delay_does_not_block_other_ready_files(self):
+        self.processor.retry_base = 5
+        self.processor.retry_max = 60
+        second = self.path.with_name('second.jpg')
+        second.write_bytes(b'second photo')
+        self.client.upload.side_effect = [ConnectionError('offline'),
+                                          {second.as_posix(): 'second-key'},
+                                          {self.path.as_posix(): 'first-key'}]
+        with patch('upload_state.time.time', return_value=100):
+            self.processor.submit(self.path)
+            self.processor.process_once()
+            self.processor.submit(second)
+            self.processor.process_once()
+            self.assertEqual(self.store.get(second)['status'], 'done')
+            self.assertEqual(self.store.get(self.path)['next_attempt'], 105)
+            self.assertFalse(self.processor.process_once())
+        with patch('upload_state.time.time', return_value=105):
+            self.processor.process_once()
+            self.assertEqual(self.store.get(self.path)['status'], 'done')
+
     def test_cleanup_retry_does_not_upload_again_even_after_restart(self):
         self.processor.delete_after_upload = True
         self.processor.submit(self.path)

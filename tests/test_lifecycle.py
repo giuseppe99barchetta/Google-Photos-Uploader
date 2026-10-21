@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from unittest.mock import Mock, patch
 
 from test_config import FAKE_AUTH
@@ -16,6 +16,7 @@ import script_gphoto
 from script_gphoto import (
     FileProcessor,
     RedactingFormatter,
+    ShutdownTimeout,
     healthcheck,
     install_signal_handlers,
     main,
@@ -67,6 +68,40 @@ class LifecycleTests(unittest.TestCase):
         message = formatter.format(record)
         self.assertNotIn('fake-token', message)
         self.assertIn('[REDACTED]', message)
+
+    def test_shutdown_deadline_leaves_slow_upload_pending(self):
+        photo = self.photos / 'slow.jpg'
+        photo.write_bytes(b'photo')
+        config = Config.from_env({**self.env, 'SHUTDOWN_TIMEOUT': '0.05'})
+        stop, release = Event(), Event()
+        threads = []
+        store = StateStore(self.state / 'uploads.db', scope=config.state_scope)
+        client = Mock()
+
+        def slow_upload(target, **kwargs):
+            stop.set()
+            release.wait(5)
+            return {Path(target).as_posix(): 'key'}
+
+        def track_thread(*args, **kwargs):
+            thread = Thread(*args, **kwargs)
+            threads.append(thread)
+            return thread
+
+        client.upload.side_effect = slow_upload
+        try:
+            with patch('script_gphoto.StateStore', return_value=store):
+                with patch('script_gphoto.Thread', side_effect=track_thread):
+                    with self.assertRaises(ShutdownTimeout):
+                        run_service(config, Mock(return_value=client), stop)
+            self.assertTrue(photo.exists())
+            self.assertFalse(healthcheck(self.state))
+            self.assertEqual(store.get(photo)['status'], 'pending')
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(timeout=5)
+            store.close()
 
     def test_signals_request_an_orderly_stop(self):
         stop = Event()

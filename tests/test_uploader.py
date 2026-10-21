@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from functools import partial
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from watchdog.events import FileCreatedEvent, FileMovedEvent
 
@@ -76,6 +76,22 @@ class UploadSafetyTests(unittest.TestCase):
         stop.set()
         with self.assertRaises(InterruptedError):
             wait_until_stable(self.path, stop_event=stop)
+
+    def test_each_copy_change_restarts_the_stability_window(self):
+        clock = [0.0]
+        stop = Mock()
+        stop.is_set.return_value = False
+
+        def advance(seconds):
+            clock[0] += seconds
+            if clock[0] <= 2:
+                self.path.write_bytes(self.path.read_bytes() + b'next chunk')
+
+        stop.wait.side_effect = advance
+        with patch('script_gphoto.time.monotonic', side_effect=lambda: clock[0]):
+            wait_until_stable(self.path, stable_seconds=2, timeout=10, stop_event=stop)
+        self.assertEqual(clock[0], 4)
+        self.assertEqual(stop.wait.call_count, 4)
 
     def test_initial_scan_finds_existing_media_recursively(self):
         nested = self.path.parent / 'nested'
