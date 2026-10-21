@@ -126,6 +126,15 @@ secrets:
 Ensure the runtime user can read the file. Keep this file private. Known input
 tokens are redacted in application logs; avoid sharing credentials or debug logs.
 
+Load the secret override explicitly with both files:
+
+```bash
+docker compose -f docker-compose.yml -f compose.override.yaml up -d
+```
+
+Use the same `-f` options for subsequent Compose commands. See the
+[Docker documentation on merging Compose files](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/).
+
 ## Health and recovery
 
 A heartbeat checks that the worker and Watchdog emitter are alive and the watched

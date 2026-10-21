@@ -11,3 +11,4 @@ __pycache__/
 *.db-shm
 *.db-wal
 failed_skipped_files.log
+/compose.override.yaml
