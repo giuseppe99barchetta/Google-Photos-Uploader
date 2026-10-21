@@ -30,7 +30,9 @@ class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name)
+        # Config resolves this path before enqueueing. Windows TEMP can use
+        # short names or casing aliases that SQLite string keys do not equate.
+        self.base = Path(self.temp.name).resolve()
         self.photos = self.base / 'photos'
         self.photos.mkdir()
         self.state = self.base / 'state'
@@ -55,8 +57,10 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(healthcheck(self.state))
         store = StateStore(self.state / 'uploads.db')
         self.addCleanup(store.close)
-        self.assertEqual(store.get(photo)['media_key'], 'key')
-        self.assertEqual(store.get(photo)['status'], 'pending')
+        job = store.get(photo)
+        self.assertIsNotNone(job, 'The confirmed upload must remain in the queue after shutdown')
+        self.assertEqual(job['media_key'], 'key')
+        self.assertEqual(job['status'], 'pending')
         FileProcessor(client, store, delete_after_upload=True).process_once()
         self.assertFalse(photo.exists())
         client.upload.assert_called_once()
@@ -96,7 +100,9 @@ class LifecycleTests(unittest.TestCase):
                         run_service(config, Mock(return_value=client), stop)
             self.assertTrue(photo.exists())
             self.assertFalse(healthcheck(self.state))
-            self.assertEqual(store.get(photo)['status'], 'pending')
+            job = store.get(photo)
+            self.assertIsNotNone(job, 'The in-flight upload must remain queued after the shutdown deadline')
+            self.assertEqual(job['status'], 'pending')
         finally:
             release.set()
             for thread in threads:
