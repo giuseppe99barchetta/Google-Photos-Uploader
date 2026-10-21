@@ -1,8 +1,7 @@
 # Google Photos Uploader
 
 Monitor a folder and upload photos and videos to Google Photos using
-[GPMC](https://github.com/xob0t/gpmc). Supports local folders and host-mounted
-SMB/NAS shares, with Docker images for AMD64 and ARM64.
+[GPMC](https://github.com/xob0t/gpmc) without consuming storage space. Supports local folders and host-mounted SMB/NAS shares, with Docker images for AMD64 and ARM64.
 
 GPMC uses a reverse-engineered mobile API. Storage accounting and authentication
 are controlled by Google and may change; verify the results in your own account.
@@ -25,6 +24,11 @@ are controlled by Google and may change; verify the results in your own account.
 following confirmation and a check that the source has not changed. Confirmation
 is committed before removal, so a failed removal can be retried after restart
 without repeating the upload. Use a dedicated upload folder and keep backups.
+
+Changing the Google account, watched folder or deletion mode resets the local
+queue's scope and rescans the source. Files are confirmed remotely again before
+they can be removed under a newly enabled deletion setting. Refreshing credentials
+for the same account preserves the queue. Remote hash checks avoid duplicate uploads.
 
 File stability is a heuristic: a copy paused longer than the configured interval
 can appear complete. For reliable ingestion, copy to an unsupported temporary

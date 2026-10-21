@@ -111,7 +111,7 @@ def upload_file(client, path, delete_after_upload=False, stable_seconds=5,
 
 class FileProcessor:
     def __init__(self, client, store, delete_after_upload=False, stop_event=None,
-                 max_attempts=5, retry_base=5, retry_max=3600, **upload_options):
+                 max_attempts=5, retry_base=5, retry_max=3600, root=None, **upload_options):
         self.client = client
         self.store = store
         self.delete_after_upload = delete_after_upload
@@ -120,20 +120,29 @@ class FileProcessor:
         self.retry_base = retry_base
         self.retry_max = retry_max
         self.upload_options = upload_options
+        self.root = Path(root).resolve() if root is not None else None
+
+    def check_path(self, path):
+        if self.root is not None and not path.resolve().is_relative_to(self.root):
+            raise ValueError('File is outside WATCHED_FOLDER')
 
     def submit(self, path):
         path = Path(path).absolute()
         try:
+            self.check_path(path)
             self.store.enqueue(path, file_signature(path))
         except FileNotFoundError:
             pass  # A queued event may refer to a file already moved or removed.
 
     def process_once(self):
+        if self.stop_event.is_set():
+            return False
         job = self.store.next_job()
         if not job:
             return False
         path = Path(job['path'])
         try:
+            self.check_path(path)
             logger.info('Processing file=%s attempt=%s operation=%s', path, job['attempts'] + 1,
                         'cleanup' if job['media_key'] else 'upload')
             if not job['media_key']:
@@ -148,6 +157,7 @@ class FileProcessor:
             if self.stop_event.is_set():
                 return True  # Keep confirmation durable; resume cleanup after restart.
             if self.delete_after_upload:
+                self.check_path(path)
                 try:
                     current_signature = file_signature(path)
                 except FileNotFoundError:
@@ -289,10 +299,10 @@ def run_service(config, client_factory, stop_event):
     write_health(state_dir, False)
     client = client_factory(auth_data=config.auth_data, timeout=config.request_timeout,
                             log_level=config.log_level)
-    store = StateStore(state_dir / 'uploads.db')
+    store = StateStore(state_dir / 'uploads.db', scope=config.state_scope)
     processor = FileProcessor(
         client, store, delete_after_upload=config.delete_after_upload,
-        stop_event=stop_event,
+        stop_event=stop_event, root=watched_folder,
         stable_seconds=config.stable_seconds, stability_timeout=config.stability_timeout,
         max_attempts=config.max_attempts, retry_base=config.retry_base, retry_max=config.retry_max)
     worker = Thread(target=processor.run, name='upload-worker', daemon=True)

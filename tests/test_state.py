@@ -87,3 +87,27 @@ class DurableQueueTests(unittest.TestCase):
         self.assertEqual(self.store.get(self.path)['status'], 'failed')
         self.processor.submit(self.path)
         self.assertEqual(self.store.get(self.path)['status'], 'pending')
+
+    def test_new_scope_requires_fresh_confirmation(self):
+        self.store.close()
+        self.store = StateStore(self.database, scope='account-one')
+        self.processor.store = self.store
+        self.processor.submit(self.path)
+        self.processor.process_once()
+        self.store.close()
+        self.store = StateStore(self.database, scope='account-two')
+        self.processor.store = self.store
+        self.processor.submit(self.path)
+        self.processor.process_once()
+        self.assertEqual(self.client.upload.call_count, 2)
+
+    def test_pending_cleanup_cannot_delete_outside_watched_root(self):
+        self.processor.submit(self.path)
+        job = self.store.next_job()
+        from script_gphoto import file_signature
+        self.store.mark_uploaded(job, file_signature(self.path), 'key')
+        self.processor.root = self.path.parent / 'different-root'
+        self.processor.delete_after_upload = True
+        self.processor.process_once()
+        self.assertTrue(self.path.exists())
+        self.client.upload.assert_not_called()

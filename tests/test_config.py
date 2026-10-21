@@ -70,3 +70,12 @@ class ConfigurationTests(unittest.TestCase):
         for options in ({'STABILITY_TIMEOUT': '1'}, {'RETRY_MAX': '1'}):
             with self.assertRaises(ValueError):
                 Config.from_env({**self.env, **options})
+
+    def test_state_scope_tracks_account_and_deletion_mode_but_not_token_refresh(self):
+        original = Config.from_env(self.env).state_scope
+        refreshed = Config.from_env({**self.env, 'AUTH_DATA': FAKE_AUTH.replace('fake-token', 'new-token')})
+        self.assertEqual(original, refreshed.state_scope)
+        other_account = Config.from_env({**self.env, 'AUTH_DATA': FAKE_AUTH.replace('test%40', 'other%40')})
+        self.assertNotEqual(original, other_account.state_scope)
+        deletion = Config.from_env({**self.env, 'DELETE_AFTER_UPLOAD': 'true'})
+        self.assertNotEqual(original, deletion.state_scope)

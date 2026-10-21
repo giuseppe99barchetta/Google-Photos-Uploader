@@ -7,7 +7,7 @@ from threading import RLock
 
 
 class StateStore:
-    def __init__(self, path):
+    def __init__(self, path, scope=None):
         self.lock = RLock()
         self.connection = sqlite3.connect(str(path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
@@ -19,6 +19,13 @@ class StateStore:
             next_attempt REAL NOT NULL DEFAULT 0, last_error TEXT
         )''')
         self.connection.execute('CREATE INDEX IF NOT EXISTS due_jobs ON jobs(status, next_attempt)')
+        self.connection.execute('CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)')
+        if scope is not None:
+            previous = self.connection.execute("SELECT value FROM metadata WHERE key='scope'").fetchone()
+            with self.connection:
+                if previous is None or previous['value'] != scope:
+                    self.connection.execute('DELETE FROM jobs')
+                    self.connection.execute("INSERT OR REPLACE INTO metadata VALUES ('scope', ?)", (scope,))
         self.connection.commit()
 
     def enqueue(self, path, signature):

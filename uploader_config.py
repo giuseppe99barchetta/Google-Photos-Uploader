@@ -1,5 +1,7 @@
 """Validate configuration before initializing the client or background threads."""
 
+import hashlib
+import json
 import math
 import os
 import tempfile
@@ -34,6 +36,14 @@ class Config:
     retry_max: float = 3600
     shutdown_timeout: float = 120
     log_level: str = 'INFO'
+
+    @property
+    def state_scope(self):
+        # Refreshing a token preserves state; switching account/root/deletion mode
+        # requires new remote confirmation before considering any source complete.
+        scope = {'account': parse_qs(self.auth_data)['Email'][0].casefold(),
+                 'root': str(self.root), 'delete': self.delete_after_upload, 'version': 1}
+        return hashlib.sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()
 
     @classmethod
     def from_env(cls, env=None):
