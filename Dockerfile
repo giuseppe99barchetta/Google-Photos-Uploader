@@ -39,4 +39,7 @@ USER appuser
 ENV PYTHONUNBUFFERED=1 \
     WATCHED_FOLDER=/data
 
+# Fail the build if the runtime user cannot import the application dependencies.
+RUN python -c "from watchdog.observers.polling import PollingObserver; from watchdog.events import FileSystemEventHandler; from gpmc import Client"
+
 CMD ["python", "-u", "script_gphoto.py"]

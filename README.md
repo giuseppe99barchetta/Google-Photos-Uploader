@@ -134,6 +134,25 @@ docker compose pull
 docker compose up -d --force-recreate
 ```
 
+### Building a local fix
+
+The default Compose configuration uses the published image. To use changes from
+this repository immediately, build the image locally and recreate the container:
+
+```bash
+docker build -t ghcr.io/giuseppe99barchetta/google-photos-uploader:latest .
+docker compose up -d --force-recreate --pull never
+docker compose logs -f
+```
+
+Run these commands from the repository root. Do not run `docker compose pull`
+after building locally: it would replace the local image with the published one.
+
+If startup reports `ModuleNotFoundError: No module named 'watchdog'`, rebuild with
+the current Dockerfile. Dependencies are copied into `/usr/local`, which is
+accessible to the container's `appuser`; the build checks the application imports
+as that user before producing the image.
+
 ---
 
 ## 💡 Notes
