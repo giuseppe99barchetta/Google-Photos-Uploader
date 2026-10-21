@@ -1,55 +1,57 @@
-import os
+﻿import os
 import time
-from watchdog.observers.polling import PollingObserver as Observer
+from pathlib import Path
+
 from watchdog.events import FileSystemEventHandler
-from gpmc import Client
+from watchdog.observers.polling import PollingObserver as Observer
 
-WATCHED_FOLDER = os.environ.get("WATCHED_FOLDER", "/data")
-AUTH_DATA = os.environ.get("AUTH_DATA", "")
 
-client = Client(auth_data=AUTH_DATA)
+MEDIA_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.mov')
+
+
+def upload_file(client, path, delete_after_upload=False):
+    path = Path(path).absolute()
+    result = client.upload(target=str(path), show_progress=False)
+    media_key = result.get(path.as_posix()) if isinstance(result, dict) else None
+    if not media_key:
+        raise RuntimeError(f'Upload not confirmed: {path}')
+    print(f'Upload confirmed: {path}')
+    if delete_after_upload:
+        path.unlink()
+        print(f'File removed: {path}')
+    return media_key
+
 
 class PhotoHandler(FileSystemEventHandler):
+    def __init__(self, client, delete_after_upload=False):
+        self.client = client
+        self.delete_after_upload = delete_after_upload
+
     def on_created(self, event):
-        if not event.is_directory and event.src_path.lower().endswith(('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.mov')):
-            print(f"Found new file: {event.src_path}")
+        if not event.is_directory and event.src_path.lower().endswith(MEDIA_EXTENSIONS):
             try:
-                # File upload
-                output = client.upload(target=event.src_path, show_progress=True)
-                print(f"Uploaded: {output}")
-                
-                # Attempt to delete with 3 retries
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        os.remove(event.src_path)
-                        print(f"File removed: {event.src_path}")
-                        break
-                    except PermissionError:
-                        if attempt < max_retries - 1:
-                            time.sleep(0.5 * (attempt + 1))
-                            continue
-                        raise
-                        
-            except Exception as e:
-                print(f"Error: {e}")
-                # Cleanup of leftover file in case of error
-                if os.path.exists(event.src_path):
-                    try:
-                        os.remove(event.src_path)
-                    except:
-                        pass
+                upload_file(self.client, event.src_path, self.delete_after_upload)
+            except Exception as error:
+                print(f'Upload failed; original retained: {event.src_path}: {error}')
 
-if __name__ == "__main__":
-    event_handler = PhotoHandler()
+
+def main():
+    from gpmc import Client
+
+    watched_folder = os.environ.get('WATCHED_FOLDER', '/data')
+    client = Client(auth_data=os.environ.get('AUTH_DATA', ''))
+    delete_after_upload = os.environ.get('DELETE_AFTER_UPLOAD', 'false').lower() == 'true'
     observer = Observer()
-    observer.schedule(event_handler, WATCHED_FOLDER, recursive=True)
+    observer.schedule(PhotoHandler(client, delete_after_upload), watched_folder, recursive=True)
     observer.start()
-    print(f"Monitoring started on {WATCHED_FOLDER}...")
-
+    print(f'Monitoring started on {watched_folder}...')
     try:
         while True:
             time.sleep(10)
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
+
+
+if __name__ == '__main__':
+    main()
