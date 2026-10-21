@@ -57,17 +57,59 @@ def upload_file(client, path, delete_after_upload=False, stable_seconds=5,
     return media_key
 
 
-class PhotoHandler(FileSystemEventHandler):
-    def __init__(self, client, delete_after_upload=False):
+class FileProcessor:
+    def __init__(self, client, **upload_options):
         self.client = client
-        self.delete_after_upload = delete_after_upload
+        self.upload_options = upload_options
+        self.completed = {}
+
+    def process(self, path):
+        path = Path(path).absolute()
+        try:
+            signature = file_signature(path)
+            if self.completed.get(str(path)) == signature:
+                return
+            upload_file(self.client, path, **self.upload_options)
+            self.completed[str(path)] = signature
+        except Exception as error:
+            print(f'Upload failed; original retained: {path}: {error}')
+
+
+def discover_files(root):
+    def scan_error(error):
+        raise error
+
+    for directory, directories, filenames in os.walk(root, onerror=scan_error):
+        directories[:] = [name for name in directories
+                          if not (Path(directory) / name).is_symlink()]
+        for name in filenames:
+            path = Path(directory) / name
+            if path.suffix.lower() in MEDIA_EXTENSIONS and not path.is_symlink():
+                yield path.absolute()
+
+
+class PhotoHandler(FileSystemEventHandler):
+    def __init__(self, submit, watched_folder):
+        self.submit = submit
+        self.root = Path(watched_folder).resolve()
+
+    def submit_path(self, path):
+        path = Path(path).absolute()
+        if (path.suffix.lower() in MEDIA_EXTENSIONS and not path.is_symlink()
+                and path.resolve().is_relative_to(self.root)):
+            self.submit(path)
 
     def on_created(self, event):
-        if not event.is_directory and event.src_path.lower().endswith(MEDIA_EXTENSIONS):
-            try:
-                upload_file(self.client, event.src_path, self.delete_after_upload)
-            except Exception as error:
-                print(f'Upload failed; original retained: {event.src_path}: {error}')
+        if not event.is_directory:
+            self.submit_path(event.src_path)
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self.submit_path(event.dest_path)
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self.submit_path(event.src_path)
 
 
 def main():
@@ -76,13 +118,16 @@ def main():
     watched_folder = os.environ.get('WATCHED_FOLDER', '/data')
     client = Client(auth_data=os.environ.get('AUTH_DATA', ''))
     delete_after_upload = os.environ.get('DELETE_AFTER_UPLOAD', 'false').lower() == 'true'
+    processor = FileProcessor(client, delete_after_upload=delete_after_upload)
     observer = Observer()
-    observer.schedule(PhotoHandler(client, delete_after_upload), watched_folder, recursive=True)
+    observer.schedule(PhotoHandler(processor.process, watched_folder), watched_folder, recursive=True)
     observer.start()
     print(f'Monitoring started on {watched_folder}...')
     try:
         while True:
-            time.sleep(10)
+            for path in discover_files(watched_folder):
+                processor.process(path)
+            time.sleep(60)
     except KeyboardInterrupt:
         observer.stop()
     observer.join()

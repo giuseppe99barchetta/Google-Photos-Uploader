@@ -4,7 +4,12 @@ from functools import partial
 from pathlib import Path
 from unittest.mock import Mock
 
-from script_gphoto import FileChangedError, upload_file as real_upload_file, wait_until_stable
+from watchdog.events import FileCreatedEvent, FileMovedEvent
+
+from script_gphoto import (
+    FileChangedError, FileProcessor, PhotoHandler, discover_files,
+    upload_file as real_upload_file, wait_until_stable,
+)
 
 upload_file = partial(real_upload_file, stable_seconds=0)
 
@@ -64,6 +69,35 @@ class UploadSafetyTests(unittest.TestCase):
         stop.set()
         with self.assertRaises(InterruptedError):
             wait_until_stable(self.path, stop_event=stop)
+
+    def test_initial_scan_finds_existing_media_recursively(self):
+        nested = self.path.parent / 'nested'
+        nested.mkdir()
+        video = nested / 'VIDEO.MP4'
+        video.write_bytes(b'video')
+        (nested / 'copy.tmp').write_bytes(b'in progress')
+        self.assertEqual(set(discover_files(self.path.parent)), {self.path, video})
+
+    def test_rename_to_supported_extension_is_submitted(self):
+        submit = Mock()
+        handler = PhotoHandler(submit, self.path.parent)
+        handler.dispatch(FileMovedEvent(str(self.path.with_suffix('.tmp')), str(self.path)))
+        submit.assert_called_once_with(self.path)
+
+    def test_outside_folder_is_not_submitted(self):
+        submit = Mock()
+        PhotoHandler(submit, self.path.parent).dispatch(FileCreatedEvent('/outside/photo.jpg'))
+        submit.assert_not_called()
+
+    def test_reconciliation_skips_completed_unchanged_files(self):
+        client = Mock(upload=Mock(return_value={self.path.as_posix(): 'key'}))
+        processor = FileProcessor(client, stable_seconds=0)
+        processor.process(self.path)
+        processor.process(self.path)
+        self.assertEqual(client.upload.call_count, 1)
+        self.path.write_bytes(b'changed photo')
+        processor.process(self.path)
+        self.assertEqual(client.upload.call_count, 2)
 
 
 if __name__ == '__main__':
