@@ -1,5 +1,7 @@
 # Google Photos Uploader
 
+![Google Photos Uploader: automatically upload photos from a local folder or NAS to Google Photos.](media/readme-hero.png)
+
 Monitor a folder and upload photos and videos to Google Photos using
 [GPMC](https://github.com/xob0t/gpmc) without consuming storage space. Supports local folders and host-mounted SMB/NAS shares, with Docker images for AMD64 and ARM64.
 
