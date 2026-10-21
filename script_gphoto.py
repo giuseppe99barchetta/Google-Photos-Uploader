@@ -10,6 +10,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver as Observer
 
 from upload_state import StateStore
+from uploader_config import Config
 
 
 MEDIA_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.mov')
@@ -221,18 +222,22 @@ def healthcheck(state_dir, max_age=30):
 
 
 def main():
+    config = Config.from_env()
     from gpmc import Client
 
-    watched_folder = os.environ.get('WATCHED_FOLDER', '/data')
-    client = Client(auth_data=os.environ.get('AUTH_DATA', ''))
-    delete_after_upload = os.environ.get('DELETE_AFTER_UPLOAD', 'false').lower() == 'true'
-    state_dir = Path(os.environ.get('STATE_DIR', '/tmp/gphotos-uploader'))
-    state_dir.mkdir(parents=True, exist_ok=True)
+    watched_folder = config.root
+    state_dir = config.state_dir
+    write_health(state_dir, False)
+    client = Client(auth_data=config.auth_data, timeout=config.request_timeout,
+                    log_level=config.log_level)
     store = StateStore(state_dir / 'uploads.db')
-    processor = FileProcessor(client, store, delete_after_upload=delete_after_upload)
+    processor = FileProcessor(
+        client, store, delete_after_upload=config.delete_after_upload,
+        stable_seconds=config.stable_seconds, stability_timeout=config.stability_timeout,
+        max_attempts=config.max_attempts, retry_base=config.retry_base, retry_max=config.retry_max)
     worker = Thread(target=processor.run, name='upload-worker', daemon=True)
     worker.start()
-    supervisor = WatchSupervisor(watched_folder, processor.submit)
+    supervisor = WatchSupervisor(watched_folder, processor.submit, config.poll_interval)
     next_scan = 0
     try:
         while not processor.stop_event.is_set():
@@ -252,7 +257,7 @@ def main():
                         if time.monotonic() - heartbeat >= 5:
                             write_health(state_dir, worker.is_alive())
                             heartbeat = time.monotonic()
-                    next_scan = time.monotonic() + 60
+                    next_scan = time.monotonic() + config.scan_interval
                 except OSError:
                     healthy = False
                     next_scan = 0
@@ -270,5 +275,5 @@ def main():
 
 if __name__ == '__main__':
     if sys.argv[1:] == ['--healthcheck']:
-        sys.exit(0 if healthcheck(os.environ.get('STATE_DIR', '/tmp/gphotos-uploader')) else 1)
+        sys.exit(0 if healthcheck(os.environ.get('STATE_DIR', '/state')) else 1)
     main()

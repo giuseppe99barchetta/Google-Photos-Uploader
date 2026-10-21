@@ -27,17 +27,19 @@ COPY --from=builder /install /usr/local
 
 # Configure non-root user
 RUN adduser -D -u 1000 appuser && \
-    mkdir /data && \
-    chown appuser:appuser /data
+    mkdir /data /state && \
+    chown appuser:appuser /data /state
 
 WORKDIR /app
 
 # Copy only necessary files
-COPY script_gphoto.py upload_state.py ./
+COPY script_gphoto.py upload_state.py uploader_config.py ./
 
 USER appuser
 ENV PYTHONUNBUFFERED=1 \
-    WATCHED_FOLDER=/data
+    WATCHED_FOLDER=/data \
+    STATE_DIR=/state \
+    HOME=/state
 
 # Fail the build if the runtime user cannot import the application dependencies.
 RUN python -c "from watchdog.observers.polling import PollingObserver; from watchdog.events import FileSystemEventHandler; from gpmc import Client"

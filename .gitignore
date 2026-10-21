@@ -1,1 +1,13 @@
 /.venv
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+/photos/
+/.state/
+/secrets/
+*.db
+*.db-shm
+*.db-wal
+failed_skipped_files.log

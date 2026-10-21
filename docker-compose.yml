@@ -4,9 +4,21 @@ services:
     container_name: gphotos-uploader
     restart: unless-stopped
     environment:
-      - WATCHED_FOLDER=/data
-      - AUTH_DATA=INSERT_YOUR_AUTH_DATA_HERE
+      WATCHED_FOLDER: /data
+      STATE_DIR: /state
+      HOME: /state
+      AUTH_DATA: ${AUTH_DATA:-}
+      AUTH_DATA_FILE: ${AUTH_DATA_FILE:-}
+      DELETE_AFTER_UPLOAD: ${DELETE_AFTER_UPLOAD:-false}
     volumes:
-      - ${PHOTO_FOLDER:-./photos}:/data
+      - type: bind
+        source: ${PHOTO_FOLDER:-./photos}
+        target: /data
+        bind:
+          create_host_path: false
+      - uploader-state:/state
     # If necessary, specify the UID/GID of the user for file permissions
     # user: "1000:1000"
+
+volumes:
+  uploader-state:

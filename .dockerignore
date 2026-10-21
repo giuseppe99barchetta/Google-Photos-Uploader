@@ -4,3 +4,13 @@ __pycache__
 .venv
 Dockerfile
 README.md
+.env
+.env.*
+photos
+.state
+secrets
+tests
+*.db
+*.db-shm
+*.db-wal
+*.log
