@@ -1,6 +1,7 @@
 import os
 import json
 import stat
+import sys
 import time
 from pathlib import Path
 from threading import Event, Thread
@@ -160,6 +161,65 @@ class PhotoHandler(FileSystemEventHandler):
             self.submit_path(event.src_path)
 
 
+class WatchSupervisor:
+    def __init__(self, root, submit, poll_interval=1):
+        self.root = Path(root)
+        self.handler = PhotoHandler(submit, root)
+        self.poll_interval = poll_interval
+        self.observer = None
+        self.identity = None
+        self.generation = 0
+
+    def stop(self):
+        if self.observer is not None:
+            self.observer.stop()
+            if self.observer.ident is not None:
+                self.observer.join()
+            self.observer = None
+
+    def check(self):
+        try:
+            info = self.root.stat()
+            if not stat.S_ISDIR(info.st_mode):
+                raise NotADirectoryError(str(self.root))
+            with os.scandir(self.root) as entries:
+                next(entries, None)
+            identity = (info.st_dev, info.st_ino)
+            if (self.observer is not None and self.observer.is_alive()
+                    and self.observer.emitters
+                    and all(emitter.is_alive() for emitter in self.observer.emitters)
+                    and identity == self.identity):
+                return True
+            self.stop()
+            self.observer = Observer(timeout=self.poll_interval)
+            self.observer.schedule(self.handler, str(self.root), recursive=True)
+            self.observer.start()
+            self.identity = identity
+            self.generation += 1
+            print(f'Monitoring active: {self.root}')
+            return True
+        except OSError as error:
+            self.stop()
+            print(f'Watched folder unavailable; waiting to reconnect: {type(error).__name__}')
+            return False
+
+
+def write_health(state_dir, healthy):
+    path = Path(state_dir) / 'health.json'
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps({'ok': healthy, 'updated_at': time.time()}), encoding='utf-8')
+    temporary.replace(path)
+
+
+def healthcheck(state_dir, max_age=30):
+    try:
+        data = json.loads((Path(state_dir) / 'health.json').read_text(encoding='utf-8'))
+        age = time.time() - data['updated_at']
+        return data['ok'] is True and 0 <= age <= max_age
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def main():
     from gpmc import Client
 
@@ -172,22 +232,43 @@ def main():
     processor = FileProcessor(client, store, delete_after_upload=delete_after_upload)
     worker = Thread(target=processor.run, name='upload-worker', daemon=True)
     worker.start()
-    observer = Observer()
-    observer.schedule(PhotoHandler(processor.submit, watched_folder), watched_folder, recursive=True)
-    observer.start()
-    print(f'Monitoring started on {watched_folder}...')
+    supervisor = WatchSupervisor(watched_folder, processor.submit)
+    next_scan = 0
     try:
-        while True:
-            for path in discover_files(watched_folder):
-                processor.submit(path)
-            time.sleep(60)
+        while not processor.stop_event.is_set():
+            if not worker.is_alive():
+                raise RuntimeError('Upload worker stopped unexpectedly')
+            generation = supervisor.generation
+            healthy = supervisor.check()
+            if supervisor.generation != generation:
+                next_scan = 0
+            if healthy and time.monotonic() >= next_scan:
+                try:
+                    heartbeat = time.monotonic()
+                    for path in discover_files(watched_folder):
+                        if processor.stop_event.is_set():
+                            break
+                        processor.submit(path)
+                        if time.monotonic() - heartbeat >= 5:
+                            write_health(state_dir, worker.is_alive())
+                            heartbeat = time.monotonic()
+                    next_scan = time.monotonic() + 60
+                except OSError:
+                    healthy = False
+                    next_scan = 0
+            write_health(state_dir, healthy and worker.is_alive())
+            processor.stop_event.wait(5)
     except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
-    processor.stop_event.set()
-    worker.join()
-    store.close()
+        pass
+    finally:
+        processor.stop_event.set()
+        write_health(state_dir, False)
+        supervisor.stop()
+        worker.join()
+        store.close()
 
 
 if __name__ == '__main__':
+    if sys.argv[1:] == ['--healthcheck']:
+        sys.exit(0 if healthcheck(os.environ.get('STATE_DIR', '/tmp/gphotos-uploader')) else 1)
     main()

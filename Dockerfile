@@ -42,4 +42,7 @@ ENV PYTHONUNBUFFERED=1 \
 # Fail the build if the runtime user cannot import the application dependencies.
 RUN python -c "from watchdog.observers.polling import PollingObserver; from watchdog.events import FileSystemEventHandler; from gpmc import Client"
 
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["python", "script_gphoto.py", "--healthcheck"]
+
 CMD ["python", "-u", "script_gphoto.py"]
