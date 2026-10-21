@@ -10,6 +10,7 @@ from script_gphoto import (
     FileChangedError, FileProcessor, PhotoHandler, discover_files,
     upload_file as real_upload_file, wait_until_stable,
 )
+from upload_state import StateStore
 
 upload_file = partial(real_upload_file, stable_seconds=0)
 
@@ -91,12 +92,17 @@ class UploadSafetyTests(unittest.TestCase):
 
     def test_reconciliation_skips_completed_unchanged_files(self):
         client = Mock(upload=Mock(return_value={self.path.as_posix(): 'key'}))
-        processor = FileProcessor(client, stable_seconds=0)
-        processor.process(self.path)
-        processor.process(self.path)
+        store = StateStore(':memory:')
+        self.addCleanup(store.close)
+        processor = FileProcessor(client, store, stable_seconds=0)
+        processor.submit(self.path)
+        processor.process_once()
+        processor.submit(self.path)
+        processor.process_once()
         self.assertEqual(client.upload.call_count, 1)
         self.path.write_bytes(b'changed photo')
-        processor.process(self.path)
+        processor.submit(self.path)
+        processor.process_once()
         self.assertEqual(client.upload.call_count, 2)
 
 

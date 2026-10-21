@@ -33,7 +33,7 @@ RUN adduser -D -u 1000 appuser && \
 WORKDIR /app
 
 # Copy only necessary files
-COPY script_gphoto.py .
+COPY script_gphoto.py upload_state.py ./
 
 USER appuser
 ENV PYTHONUNBUFFERED=1 \
