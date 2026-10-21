@@ -1,10 +1,13 @@
 import json
+import logging
 import os
+import signal
 import stat
 import sys
 import time
 from pathlib import Path
 from threading import Event, Thread
+from urllib.parse import parse_qs, quote_plus
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver as Observer
@@ -13,6 +16,44 @@ from upload_state import StateStore
 from uploader_config import Config
 
 MEDIA_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.mov')
+logger = logging.getLogger('gphotos_uploader')
+
+
+class RedactingFormatter(logging.Formatter):
+    converter = time.gmtime
+
+    def __init__(self, auth_data):
+        super().__init__('%(asctime)sZ %(levelname)s %(threadName)s %(message)s',
+                         datefmt='%Y-%m-%dT%H:%M:%S')
+        tokens = parse_qs(auth_data).get('Token', [])
+        self.secrets = sorted({value for token in [auth_data, *tokens]
+                               for value in (token, quote_plus(token)) if value}, key=len, reverse=True)
+
+    def format(self, record):
+        message = super().format(record)
+        for secret in self.secrets:
+            message = message.replace(secret, '[REDACTED]')
+        return message
+
+
+def configure_logging(config):
+    handler = logging.StreamHandler()
+    handler.setFormatter(RedactingFormatter(config.auth_data))
+    logging.basicConfig(level=config.log_level, handlers=[handler], force=True)
+
+
+def install_signal_handlers(stop_event):
+    def request_stop(signum, frame):
+        stop_event.set()
+
+    previous = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous[signum] = signal.signal(signum, request_stop)
+    return previous
+
+
+class ShutdownTimeout(RuntimeError):
+    pass
 
 
 class FileChangedError(RuntimeError):
@@ -48,6 +89,7 @@ def upload_file(client, path, delete_after_upload=False, stable_seconds=5,
                 stability_timeout=300, stop_event=None, on_confirmed=None):
     path = Path(path).absolute()
     signature = wait_until_stable(path, stable_seconds, stability_timeout, stop_event)
+    started = time.monotonic()
     result = client.upload(target=str(path), show_progress=False)
     media_key = result.get(path.as_posix()) if isinstance(result, dict) else None
     if not media_key:
@@ -56,10 +98,14 @@ def upload_file(client, path, delete_after_upload=False, stable_seconds=5,
         raise FileChangedError(f'File changed during upload; original retained: {path}')
     if on_confirmed:
         on_confirmed(signature, media_key)
-    print(f'Upload confirmed: {path}')
+    logger.info('Upload confirmed file=%s duration=%.2fs', path, time.monotonic() - started)
     if delete_after_upload:
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError('Cleanup deferred until restart')
+        if file_signature(path) != signature:
+            raise FileChangedError(f'File changed before cleanup: {path}')
         path.unlink()
-        print(f'File removed: {path}')
+        logger.info('Original removed file=%s', path)
     return media_key
 
 
@@ -88,6 +134,8 @@ class FileProcessor:
             return False
         path = Path(job['path'])
         try:
+            logger.info('Processing file=%s attempt=%s operation=%s', path, job['attempts'] + 1,
+                        'cleanup' if job['media_key'] else 'upload')
             if not job['media_key']:
                 def confirmed(signature, media_key):
                     nonlocal job
@@ -97,6 +145,8 @@ class FileProcessor:
 
                 upload_file(self.client, path, stop_event=self.stop_event,
                             on_confirmed=confirmed, **self.upload_options)
+            if self.stop_event.is_set():
+                return True  # Keep confirmation durable; resume cleanup after restart.
             if self.delete_after_upload:
                 try:
                     current_signature = file_signature(path)
@@ -107,21 +157,27 @@ class FileProcessor:
                         self.submit(path)
                         raise FileChangedError(f'File changed before cleanup: {path}')
                     path.unlink()
+                    logger.info('Original removed file=%s', path)
             self.store.complete(path, job['signature'])
-        except InterruptedError:
-            pass  # Leave the job pending for the next process.
         except Exception as error:
-            print(f'Upload failed; original retained: {path}: {error}')
+            if isinstance(error, InterruptedError) and self.stop_event.is_set():
+                return True
             # Upload confirmation must survive a cleanup failure.
             current = self.store.get(path)
             if current and current['signature'] == job['signature']:
-                self.store.fail(current, error, self.max_attempts, self.retry_base, self.retry_max)
+                attempts, delay, exhausted = self.store.fail(
+                    current, error, self.max_attempts, self.retry_base, self.retry_max)
+                logger.warning('Original retained file=%s error=%s attempts=%s retry_in=%.1fs cooldown=%s',
+                               path, type(error).__name__, attempts, delay, exhausted)
         return True
 
     def run(self):
-        while not self.stop_event.is_set():
-            if not self.process_once():
-                self.stop_event.wait(0.5)
+        try:
+            while not self.stop_event.is_set():
+                if not self.process_once():
+                    self.stop_event.wait(0.5)
+        except Exception as error:
+            logger.error('Worker stopped error=%s; pending work remains in SQLite', type(error).__name__)
 
 
 def discover_files(root):
@@ -143,10 +199,13 @@ class PhotoHandler(FileSystemEventHandler):
         self.root = Path(watched_folder).resolve()
 
     def submit_path(self, path):
-        path = Path(path).absolute()
-        if (path.suffix.lower() in MEDIA_EXTENSIONS and not path.is_symlink()
-                and path.resolve().is_relative_to(self.root)):
-            self.submit(path)
+        try:
+            path = Path(path).absolute()
+            if (path.suffix.lower() in MEDIA_EXTENSIONS and not path.is_symlink()
+                    and path.resolve().is_relative_to(self.root)):
+                self.submit(path)
+        except (OSError, ValueError) as error:
+            logger.warning('File event deferred to reconciliation error=%s', type(error).__name__)
 
     def on_created(self, event):
         if not event.is_directory:
@@ -169,6 +228,7 @@ class WatchSupervisor:
         self.observer = None
         self.identity = None
         self.generation = 0
+        self.last_error = None
 
     def stop(self):
         if self.observer is not None:
@@ -196,11 +256,14 @@ class WatchSupervisor:
             self.observer.start()
             self.identity = identity
             self.generation += 1
-            print(f'Monitoring active: {self.root}')
+            self.last_error = None
+            logger.info('Monitoring active folder=%s', self.root)
             return True
         except OSError as error:
             self.stop()
-            print(f'Watched folder unavailable; waiting to reconnect: {type(error).__name__}')
+            if self.last_error != type(error).__name__:
+                self.last_error = type(error).__name__
+                logger.warning('Folder unavailable; reconnecting error=%s', self.last_error)
             return False
 
 
@@ -220,25 +283,25 @@ def healthcheck(state_dir, max_age=30):
         return False
 
 
-def main():
-    config = Config.from_env()
-    from gpmc import Client
-
+def run_service(config, client_factory, stop_event):
     watched_folder = config.root
     state_dir = config.state_dir
     write_health(state_dir, False)
-    client = Client(auth_data=config.auth_data, timeout=config.request_timeout,
-                    log_level=config.log_level)
+    client = client_factory(auth_data=config.auth_data, timeout=config.request_timeout,
+                            log_level=config.log_level)
     store = StateStore(state_dir / 'uploads.db')
     processor = FileProcessor(
         client, store, delete_after_upload=config.delete_after_upload,
+        stop_event=stop_event,
         stable_seconds=config.stable_seconds, stability_timeout=config.stability_timeout,
         max_attempts=config.max_attempts, retry_base=config.retry_base, retry_max=config.retry_max)
     worker = Thread(target=processor.run, name='upload-worker', daemon=True)
-    worker.start()
     supervisor = WatchSupervisor(watched_folder, processor.submit, config.poll_interval)
     next_scan = 0
     try:
+        worker.start()
+        logger.info('Service started folder=%s delete_after_upload=%s',
+                    watched_folder, config.delete_after_upload)
         while not processor.stop_event.is_set():
             if not worker.is_alive():
                 raise RuntimeError('Upload worker stopped unexpectedly')
@@ -257,22 +320,60 @@ def main():
                             write_health(state_dir, worker.is_alive())
                             heartbeat = time.monotonic()
                     next_scan = time.monotonic() + config.scan_interval
-                except OSError:
+                except OSError as error:
+                    logger.warning('Reconciliation interrupted error=%s', type(error).__name__)
                     healthy = False
                     next_scan = 0
             write_health(state_dir, healthy and worker.is_alive())
             processor.stop_event.wait(5)
-    except KeyboardInterrupt:
-        pass
     finally:
         processor.stop_event.set()
-        write_health(state_dir, False)
-        supervisor.stop()
-        worker.join()
+        try:
+            write_health(state_dir, False)
+        except OSError:
+            logger.error('Could not update health during shutdown')
+        deadline = time.monotonic() + config.shutdown_timeout
+        monitor_stop = Thread(target=supervisor.stop, name='monitor-shutdown', daemon=True)
+        monitor_stop.start()
+        monitor_stop.join(timeout=max(0, deadline - time.monotonic()))
+        if worker.ident is not None:
+            worker.join(timeout=max(0, deadline - time.monotonic()))
+        if worker.is_alive() or monitor_stop.is_alive():
+            raise ShutdownTimeout('Shutdown deadline exceeded; pending work remains durable')
         store.close()
+        logger.info('Service stopped; pending work saved')
+
+
+def main():
+    try:
+        config = Config.from_env()
+    except (ValueError, OSError) as error:
+        logging.basicConfig(level=logging.ERROR)
+        logger.error('Configuration error: %s', error)
+        return 2
+    configure_logging(config)
+    # GPMC changes SIGINT when imported; install our handlers afterwards.
+    from gpmc import Client
+
+    stop_event = Event()
+    previous = install_signal_handlers(stop_event)
+    try:
+        run_service(config, Client, stop_event)
+        return 0
+    except ShutdownTimeout:
+        logger.error('Shutdown timed out; exiting with durable pending work')
+        logging.shutdown()
+        # GPMC's executor threads can otherwise keep the interpreter alive.
+        os._exit(1)
+    except Exception as error:
+        logger.error('Service failed error=%s', type(error).__name__)
+        return 1
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 if __name__ == '__main__':
     if sys.argv[1:] == ['--healthcheck']:
         sys.exit(0 if healthcheck(os.environ.get('STATE_DIR', '/state')) else 1)
-    main()
+    sys.exit(main())

@@ -65,6 +65,7 @@ class StateStore:
                 status=?, last_error=? WHERE path=? AND signature=?''',
                 (attempts, time.time() + (retry_max if exhausted else delay),
                  'failed' if exhausted else 'pending', type(error).__name__, job['path'], job['signature']))
+        return attempts, retry_max if exhausted else delay, exhausted
 
     def get(self, path):
         with self.lock:

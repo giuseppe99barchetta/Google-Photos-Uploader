@@ -3,6 +3,12 @@ services:
     image: ghcr.io/giuseppe99barchetta/google-photos-uploader:latest
     container_name: gphotos-uploader
     restart: unless-stopped
+    stop_grace_period: 150s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       WATCHED_FOLDER: /data
       STATE_DIR: /state
