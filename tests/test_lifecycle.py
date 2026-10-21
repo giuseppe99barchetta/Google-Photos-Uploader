@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 from test_config import FAKE_AUTH
 
+import script_gphoto
 from script_gphoto import (
     FileProcessor,
     RedactingFormatter,
@@ -85,7 +86,7 @@ class LifecycleTests(unittest.TestCase):
     @unittest.skipUnless(os.name == 'posix', 'POSIX SIGTERM behavior is verified on Linux CI')
     def test_real_sigterm_exits_cleanly(self):
         process = subprocess.Popen(
-            [sys.executable, '-B', 'script_gphoto.py'], env=self.env,
+            [sys.executable, '-B', str(Path(script_gphoto.__file__).resolve())], env=self.env,
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         try:
             deadline = time.monotonic() + 10

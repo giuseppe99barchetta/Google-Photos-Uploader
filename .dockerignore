@@ -1,16 +1,7 @@
-__pycache__
-*.pyc
-.git
-.venv
-Dockerfile
-README.md
-.env
-.env.*
-photos
-.state
-secrets
-tests
-*.db
-*.db-shm
-*.db-wal
-*.log
+# Only runtime source and dependencies belong in the build context.
+**
+!Dockerfile
+!requirements.txt
+!script_gphoto.py
+!upload_state.py
+!uploader_config.py
