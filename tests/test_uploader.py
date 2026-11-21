@@ -98,8 +98,10 @@ class UploadSafetyTests(unittest.TestCase):
         nested.mkdir()
         video = nested / 'VIDEO.MP4'
         video.write_bytes(b'video')
+        mkv = nested / 'clip.MKV'
+        mkv.write_bytes(b'video')
         (nested / 'copy.tmp').write_bytes(b'in progress')
-        self.assertEqual(set(discover_files(self.path.parent)), {self.path, video})
+        self.assertEqual(set(discover_files(self.path.parent)), {self.path, video, mkv})
 
     def test_rename_to_supported_extension_is_submitted(self):
         submit = Mock()

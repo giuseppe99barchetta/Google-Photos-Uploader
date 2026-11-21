@@ -11,7 +11,7 @@ are controlled by Google and may change; verify the results in your own account.
 ## File handling
 
 - **Originals are kept by default**, including after failed or unconfirmed uploads.
-- JPG, JPEG, PNG, HEIC, MP4 and MOV are supported, including uppercase extensions.
+- JPG, JPEG, PNG, HEIC, MP4, MOV and MKV are supported, including uppercase extensions.
 - Existing files are scanned at startup and periodically. New files, modifications
   and renames are also detected using polling. Symbolic links are excluded.
 - Nonempty files must remain unchanged for `STABLE_SECONDS` before uploading.
