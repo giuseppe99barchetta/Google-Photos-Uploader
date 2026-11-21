@@ -29,7 +29,7 @@ class Config:
     stable_seconds: float = 5
     stability_timeout: float = 300
     scan_interval: float = 60
-    poll_interval: float = 1
+    poll_interval: float = 30
     request_timeout: int = 60
     max_attempts: int = 5
     retry_base: float = 5
@@ -92,7 +92,7 @@ class Config:
             stable_seconds=number(env, 'STABLE_SECONDS', 5),
             stability_timeout=number(env, 'STABILITY_TIMEOUT', 300),
             scan_interval=number(env, 'SCAN_INTERVAL', 60),
-            poll_interval=number(env, 'POLL_INTERVAL', 1),
+            poll_interval=number(env, 'POLL_INTERVAL', 30),
             request_timeout=number(env, 'REQUEST_TIMEOUT', 60, integer=True),
             max_attempts=number(env, 'MAX_ATTEMPTS', 5, integer=True),
             retry_base=number(env, 'RETRY_BASE', 5),

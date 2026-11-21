@@ -6,7 +6,7 @@ import stat
 import sys
 import time
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from urllib.parse import parse_qs, quote_plus
 
 from watchdog.events import FileSystemEventHandler
@@ -16,6 +16,8 @@ from upload_state import StateStore
 from uploader_config import Config
 
 MEDIA_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.mov', '.mkv')
+# macOS ._ files and dot-folders, Synology @eaDir thumbnails and #recycle bins.
+SKIPPED_PREFIXES = ('.', '@', '#')
 logger = logging.getLogger('gphotos_uploader')
 
 
@@ -64,14 +66,27 @@ def file_signature(path):
     info = Path(path).lstat()
     if not stat.S_ISREG(info.st_mode):
         raise ValueError(f'Not a regular file: {path}')
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    # No ctime: chmod/chown must not make the whole library look new.
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
 
 
-def wait_until_stable(path, stable_seconds=5, timeout=300, stop_event=None):
+def is_media(path, root):
+    root = Path(root)
+    if path.suffix.lower() not in MEDIA_EXTENSIONS or path.is_symlink():
+        return False
+    # Check the resolved path too, so a symlink inside a hidden folder cannot bypass the rule.
+    for candidate in (path, path.resolve()):
+        if candidate.is_relative_to(root) and any(
+                part.startswith(SKIPPED_PREFIXES) for part in candidate.relative_to(root).parts):
+            return False
+    return True
+
+
+def wait_until_stable(path, stable_seconds=5, timeout=300, stop_event=None, known=None):
     stop_event = stop_event or Event()
     deadline = time.monotonic() + timeout
-    previous = None
-    unchanged_since = time.monotonic()
+    # known=(signature, monotonic time first seen) lets an already-quiet file skip the wait.
+    previous, unchanged_since = known or (None, time.monotonic())
     while not stop_event.is_set():
         signature = file_signature(path)
         now = time.monotonic()
@@ -85,10 +100,10 @@ def wait_until_stable(path, stable_seconds=5, timeout=300, stop_event=None):
     raise InterruptedError('Upload cancelled during shutdown')
 
 
-def upload_file(client, path, delete_after_upload=False, stable_seconds=5,
-                stability_timeout=300, stop_event=None, on_confirmed=None):
+def upload_file(client, path, stable_seconds=5, stability_timeout=300, stop_event=None,
+                on_confirmed=None, known=None):
     path = Path(path).absolute()
-    signature = wait_until_stable(path, stable_seconds, stability_timeout, stop_event)
+    signature = wait_until_stable(path, stable_seconds, stability_timeout, stop_event, known)
     started = time.monotonic()
     result = client.upload(target=str(path), show_progress=False)
     media_key = result.get(path.as_posix()) if isinstance(result, dict) else None
@@ -99,13 +114,6 @@ def upload_file(client, path, delete_after_upload=False, stable_seconds=5,
     if on_confirmed:
         on_confirmed(signature, media_key)
     logger.info('Upload confirmed file=%s duration=%.2fs', path, time.monotonic() - started)
-    if delete_after_upload:
-        if stop_event is not None and stop_event.is_set():
-            raise InterruptedError('Cleanup deferred until restart')
-        if file_signature(path) != signature:
-            raise FileChangedError(f'File changed before cleanup: {path}')
-        path.unlink()
-        logger.info('Original removed file=%s', path)
     return media_key
 
 
@@ -121,6 +129,8 @@ class FileProcessor:
         self.retry_max = retry_max
         self.upload_options = upload_options
         self.root = Path(root).resolve() if root is not None else None
+        self.first_seen = {}  # path -> (signature, monotonic time), pending files only
+        self.seen_lock = Lock()
 
     def check_path(self, path):
         if self.root is not None and not path.resolve().is_relative_to(self.root):
@@ -130,9 +140,16 @@ class FileProcessor:
         path = Path(path).absolute()
         try:
             self.check_path(path)
-            self.store.enqueue(path, file_signature(path))
+            signature = file_signature(path)
+            with self.seen_lock:
+                if self.store.enqueue(path, signature):
+                    seen = self.first_seen.get(str(path))
+                    if seen is None or seen[0] != signature:
+                        self.first_seen[str(path)] = (signature, time.monotonic())
         except FileNotFoundError:
             pass  # A queued event may refer to a file already moved or removed.
+        except OSError as error:
+            logger.warning('File skipped until next scan file=%s error=%s', path, type(error).__name__)
 
     def process_once(self):
         if self.stop_event.is_set():
@@ -143,6 +160,11 @@ class FileProcessor:
         path = Path(job['path'])
         try:
             self.check_path(path)
+            if self.root is not None and not is_media(path, self.root):
+                # Queued by an older version before hidden/system files were excluded.
+                logger.info('Excluded file skipped file=%s', path)
+                self.store.complete(path, job['signature'])
+                return True
             logger.info('Processing file=%s attempt=%s operation=%s', path, job['attempts'] + 1,
                         'cleanup' if job['media_key'] else 'upload')
             if not job['media_key']:
@@ -152,8 +174,8 @@ class FileProcessor:
                         raise FileChangedError(f'File was replaced while queued: {path}')
                     job = {**job, 'signature': json.dumps(signature), 'media_key': media_key}
 
-                upload_file(self.client, path, stop_event=self.stop_event,
-                            on_confirmed=confirmed, **self.upload_options)
+                upload_file(self.client, path, stop_event=self.stop_event, on_confirmed=confirmed,
+                            known=self.first_seen.get(str(path)), **self.upload_options)
             if self.stop_event.is_set():
                 return True  # Keep confirmation durable; resume cleanup after restart.
             if self.delete_after_upload:
@@ -179,6 +201,11 @@ class FileProcessor:
                     current, error, self.max_attempts, self.retry_base, self.retry_max)
                 logger.warning('Original retained file=%s error=%s attempts=%s retry_in=%.1fs cooldown=%s',
                                path, type(error).__name__, attempts, delay, exhausted)
+        finally:
+            with self.seen_lock:
+                current = self.store.get(path)
+                if not current or current['status'] != 'pending':
+                    self.first_seen.pop(str(path), None)
         return True
 
     def run(self):
@@ -192,15 +219,24 @@ class FileProcessor:
 
 def discover_files(root):
     def scan_error(error):
-        raise error
+        # A missing or unreadable root must still fail the scan; one bad subfolder must not.
+        if error.filename is None or os.path.abspath(error.filename) == os.path.abspath(root):
+            raise error
+        logger.warning('Unreadable folder skipped folder=%s error=%s', error.filename, type(error).__name__)
 
     for directory, directories, filenames in os.walk(root, onerror=scan_error):
-        directories[:] = [name for name in directories
-                          if not (Path(directory) / name).is_symlink()]
-        for name in filenames:
-            path = Path(directory) / name
-            if path.suffix.lower() in MEDIA_EXTENSIONS and not path.is_symlink():
-                yield path.absolute()
+        try:
+            directories[:] = [name for name in directories if not name.startswith(SKIPPED_PREFIXES)
+                              and not (Path(directory) / name).is_symlink()]
+            media = [path for name in filenames if is_media(path := Path(directory) / name, root)]
+        except OSError as error:
+            # Listable but not searchable: entries exist but their metadata cannot be read.
+            if os.path.abspath(directory) == os.path.abspath(root):
+                raise
+            logger.warning('Unreadable folder skipped folder=%s error=%s', directory, type(error).__name__)
+            directories[:] = []
+            continue
+        yield from (path.absolute() for path in media)
 
 
 class PhotoHandler(FileSystemEventHandler):
@@ -211,8 +247,7 @@ class PhotoHandler(FileSystemEventHandler):
     def submit_path(self, path):
         try:
             path = Path(path).absolute()
-            if (path.suffix.lower() in MEDIA_EXTENSIONS and not path.is_symlink()
-                    and path.resolve().is_relative_to(self.root)):
+            if path.resolve().is_relative_to(self.root) and is_media(path, self.root):
                 self.submit(path)
         except (OSError, ValueError) as error:
             logger.warning('File event deferred to reconciliation error=%s', type(error).__name__)

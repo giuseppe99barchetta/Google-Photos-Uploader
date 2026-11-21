@@ -20,6 +20,17 @@ class StateStore:
         )''')
         self.connection.execute('CREATE INDEX IF NOT EXISTS due_jobs ON jobs(status, next_attempt)')
         self.connection.execute('CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)')
+        migrated = self.connection.execute(
+            "SELECT value FROM metadata WHERE key='signature_fields'").fetchone()
+        if migrated is None:
+            with self.connection:
+                # Signatures lost ctime; json.dumps keeps the string form that queries compare.
+                for row in self.connection.execute('SELECT path, signature FROM jobs').fetchall():
+                    fields = json.loads(row['signature'])
+                    if len(fields) == 5:
+                        self.connection.execute('UPDATE jobs SET signature=? WHERE path=?',
+                                                (json.dumps(fields[:4]), row['path']))
+                self.connection.execute("INSERT INTO metadata VALUES ('signature_fields', '4')")
         if scope is not None:
             previous = self.connection.execute("SELECT value FROM metadata WHERE key='scope'").fetchone()
             with self.connection:
@@ -29,6 +40,7 @@ class StateStore:
         self.connection.commit()
 
     def enqueue(self, path, signature):
+        """Return True when the job is pending afterwards."""
         signature = json.dumps(signature)
         with self.lock, self.connection:
             existing = self.connection.execute('SELECT * FROM jobs WHERE path=?', (str(path),)).fetchone()
@@ -36,11 +48,13 @@ class StateStore:
                 if existing['status'] == 'failed' and existing['next_attempt'] <= time.time():
                     self.connection.execute(
                         "UPDATE jobs SET status='pending', attempts=0 WHERE path=?", (str(path),))
-                return
+                    return True
+                return existing['status'] == 'pending'
             self.connection.execute('''INSERT INTO jobs(path, signature) VALUES (?, ?)
                 ON CONFLICT(path) DO UPDATE SET signature=excluded.signature,
                 status='pending', media_key=NULL, attempts=0, next_attempt=0, last_error=NULL''',
                 (str(path), signature))
+            return True
 
     def next_job(self):
         with self.lock:

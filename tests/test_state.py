@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -80,6 +81,69 @@ class DurableQueueTests(unittest.TestCase):
         self.processor.process_once()
         self.assertFalse(self.path.exists())
         self.client.upload.assert_called_once()
+
+    def test_change_before_deferred_cleanup_keeps_file_and_requeues(self):
+        self.processor.delete_after_upload = True
+        self.processor.submit(self.path)
+        with patch.object(Path, 'unlink', side_effect=PermissionError('locked')):
+            self.processor.process_once()
+        self.assertEqual(self.store.get(self.path)['media_key'], 'key')
+        self.path.write_bytes(b'changed photo, not uploaded yet')
+        self.reopen()
+        self.processor.process_once()
+        self.assertEqual(self.path.read_bytes(), b'changed photo, not uploaded yet')
+        job = self.store.get(self.path)
+        self.assertEqual(job['status'], 'pending')
+        self.assertIsNone(job['media_key'])
+        self.client.upload.assert_called_once()
+
+    def write_old_signature(self, media_key, status):
+        # Rows written before ctime was dropped carry a fifth signature field.
+        info = self.path.lstat()
+        old = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+        with self.store.connection:
+            self.store.connection.execute(
+                'INSERT INTO jobs(path, signature, status, media_key) VALUES (?, ?, ?, ?)',
+                (str(self.path.absolute()), json.dumps(old), status, media_key))
+            # Simulate a database created before the migration marker existed.
+            self.store.connection.execute("DELETE FROM metadata WHERE key='signature_fields'")
+        self.reopen()
+
+    def test_done_row_with_old_signature_is_not_uploaded_again(self):
+        self.write_old_signature(None, 'done')
+        self.processor.submit(self.path)
+        self.assertFalse(self.processor.process_once())
+        self.client.upload.assert_not_called()
+
+    def test_cleanup_row_with_old_signature_keeps_its_confirmation(self):
+        self.write_old_signature('key', 'pending')
+        self.processor.submit(self.path)
+        self.assertEqual(self.store.get(self.path)['media_key'], 'key')
+        self.processor.delete_after_upload = True
+        self.processor.process_once()
+        self.assertFalse(self.path.exists())
+        self.client.upload.assert_not_called()
+
+    def test_hidden_jobs_from_older_versions_are_closed_without_upload_or_delete(self):
+        from script_gphoto import file_signature
+        hidden = Path(self.temp.name) / '#recycle' / 'old.jpg'
+        hidden.parent.mkdir()
+        hidden.write_bytes(b'deleted photo')
+        apple = Path(self.temp.name) / '._photo.jpg'
+        apple.write_bytes(b'resource fork')
+        self.store.enqueue(hidden, file_signature(hidden))
+        self.store.enqueue(apple, file_signature(apple))
+        self.store.mark_uploaded(self.store.get(apple), file_signature(apple), 'key')
+        self.reopen()
+        self.processor.root = Path(self.temp.name).resolve()
+        self.processor.delete_after_upload = True
+        self.processor.process_once()
+        self.processor.process_once()
+        self.assertTrue(hidden.exists())
+        self.assertTrue(apple.exists())
+        self.assertEqual(self.store.get(hidden)['status'], 'done')
+        self.assertEqual(self.store.get(apple)['status'], 'done')
+        self.client.upload.assert_not_called()
 
     def test_replacement_after_confirmation_is_retained_and_requeued(self):
         self.processor.delete_after_upload = True

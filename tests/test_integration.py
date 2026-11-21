@@ -70,5 +70,5 @@ class IntegrationTests(unittest.TestCase):
         client = Client(auth_data=FAKE_AUTH, log_level='CRITICAL')
         with patch.object(client, '_upload_file', side_effect=ConnectionError('offline')):
             with self.assertRaises(RuntimeError):
-                upload_file(client, photo, delete_after_upload=True, stable_seconds=0)
+                upload_file(client, photo, stable_seconds=0)
         self.assertTrue(photo.exists())

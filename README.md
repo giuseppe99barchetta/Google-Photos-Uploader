@@ -12,11 +12,19 @@ are controlled by Google and may change; verify the results in your own account.
 
 - **Originals are kept by default**, including after failed or unconfirmed uploads.
 - JPG, JPEG, PNG, HEIC, MP4, MOV and MKV are supported, including uppercase extensions.
-- Existing files are scanned at startup and periodically. New files, modifications
-  and renames are also detected using polling. Symbolic links are excluded.
-- Nonempty files must remain unchanged for `STABLE_SECONDS` before uploading.
+- Existing files are scanned at startup and every `SCAN_INTERVAL`. New files,
+  modifications and renames are also detected by polling every `POLL_INTERVAL`.
+  Symbolic links are excluded.
+- Hidden and system names are skipped: anything whose file or folder name starts
+  with `.`, `@` or `#` (macOS `._*` files, dot-folders, Synology `@eaDir` and
+  `#recycle`). Rename user folders that start with these characters.
+- A subfolder that cannot be read is logged and skipped; the rest of the folder is
+  still processed. Only an unreadable watched folder marks the service unhealthy.
+- Nonempty files must remain unchanged for `STABLE_SECONDS` before uploading,
+  counted from when the service first saw them, so an existing backlog is not
+  delayed file by file.
 - An upload is confirmed only when GPMC returns a media key for that exact path.
-  The file's identity, size and timestamps are checked again after upload.
+  The file's identity, size and modification time are checked again after upload.
 - SQLite records pending work and confirmed uploads. Unchanged completed files
   are skipped after restart. GPMC also checks remote duplicates by content hash.
 - Errors use exponential backoff. After `MAX_ATTEMPTS`, the file stays on disk;
@@ -88,7 +96,7 @@ runs read the same environment variables. Invalid values fail before workers sta
 | `STABLE_SECONDS` | `5` | Time a nonempty file must remain unchanged |
 | `STABILITY_TIMEOUT` | `300` | Maximum wait for a stable file per attempt |
 | `SCAN_INTERVAL` | `60` | Interval between reconciliation scans |
-| `POLL_INTERVAL` | `1` | Watchdog polling interval |
+| `POLL_INTERVAL` | `30` | Watchdog polling interval; each poll reads every file's metadata |
 | `REQUEST_TIMEOUT` | `60` | Per-request timeout passed to GPMC; its internal retries can extend an operation |
 | `MAX_ATTEMPTS` | `5` | Failed attempts before cooldown |
 | `RETRY_BASE` | `5` | Initial retry delay |
