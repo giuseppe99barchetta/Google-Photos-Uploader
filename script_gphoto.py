@@ -71,13 +71,15 @@ def file_signature(path):
 
 
 def is_media(path, root):
+    """root: the watched folder as written in the paths being checked (not necessarily resolved)."""
     root = Path(root)
     if path.suffix.lower() not in MEDIA_EXTENSIONS or path.is_symlink():
         return False
     # Check the resolved path too, so a symlink inside a hidden folder cannot bypass the rule.
-    for candidate in (path, path.resolve()):
-        if candidate.is_relative_to(root) and any(
-                part.startswith(SKIPPED_PREFIXES) for part in candidate.relative_to(root).parts):
+    # Each form is compared with the same form of root (Windows short names differ from resolved ones).
+    for candidate, base in ((path, root), (path.resolve(), root.resolve())):
+        if candidate.is_relative_to(base) and any(
+                part.startswith(SKIPPED_PREFIXES) for part in candidate.relative_to(base).parts):
             return False
     return True
 
@@ -242,12 +244,13 @@ def discover_files(root):
 class PhotoHandler(FileSystemEventHandler):
     def __init__(self, submit, watched_folder):
         self.submit = submit
-        self.root = Path(watched_folder).resolve()
+        self.watched_folder = Path(watched_folder).absolute()  # same form as event paths
+        self.root = self.watched_folder.resolve()
 
     def submit_path(self, path):
         try:
             path = Path(path).absolute()
-            if path.resolve().is_relative_to(self.root) and is_media(path, self.root):
+            if path.resolve().is_relative_to(self.root) and is_media(path, self.watched_folder):
                 self.submit(path)
         except (OSError, ValueError) as error:
             logger.warning('File event deferred to reconciliation error=%s', type(error).__name__)
