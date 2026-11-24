@@ -5,8 +5,10 @@ import signal
 import stat
 import sys
 import time
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from threading import Event, Lock, Thread
+from typing import Any
 from urllib.parse import parse_qs, quote_plus
 
 from watchdog.events import FileSystemEventHandler
@@ -18,30 +20,67 @@ from uploader_config import Config
 MEDIA_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.mov', '.mkv')
 # macOS ._ files and dot-folders, Synology @eaDir thumbnails and #recycle bins.
 SKIPPED_PREFIXES = ('.', '@', '#')
+ACTIVE_UPLOAD_PHASES = frozenset({'hashing', 'checking', 'uploading', 'finalizing'})
+TERMINAL_UPLOAD_PHASES = frozenset({'complete', 'skipped', 'error'})
+FileSignature = tuple[int, int, int, int]
+BatchCandidate = tuple[dict[str, Any], Path, FileSignature]
 logger = logging.getLogger('gphotos_uploader')
 
 
 class RedactingFormatter(logging.Formatter):
     converter = time.gmtime
 
-    def __init__(self, auth_data):
+    def __init__(self, auth_data: str = '') -> None:
         super().__init__('%(asctime)sZ %(levelname)s %(threadName)s %(message)s',
                          datefmt='%Y-%m-%dT%H:%M:%S')
-        tokens = parse_qs(auth_data).get('Token', [])
-        self.secrets = sorted({value for token in [auth_data, *tokens]
-                               for value in (token, quote_plus(token)) if value}, key=len, reverse=True)
+        self._lock = Lock()
+        self.secrets: list[str] = []
+        self.add_secrets(auth_data)
 
-    def format(self, record):
+    def add_secrets(self, auth_data: str) -> None:
+        if not auth_data:
+            return
+        parsed = parse_qs(auth_data)
+        tokens = parsed.get('Token', []) + parsed.get('Auth', [])
+        additions = {
+            value
+            for token in [auth_data, *tokens]
+            for value in (token, quote_plus(token))
+            if value
+        }
+        with self._lock:
+            merged = set(self.secrets) | additions
+            self.secrets = sorted(merged, key=len, reverse=True)
+
+    def format(self, record: logging.LogRecord) -> str:
         message = super().format(record)
-        for secret in self.secrets:
+        with self._lock:
+            secrets_snapshot = list(self.secrets)
+        for secret in secrets_snapshot:
             message = message.replace(secret, '[REDACTED]')
         return message
 
 
-def configure_logging(config):
+_active_formatter: RedactingFormatter | None = None
+
+
+def configure_logging(config: Config) -> RedactingFormatter:
+    global _active_formatter
     handler = logging.StreamHandler()
-    handler.setFormatter(RedactingFormatter(config.auth_data))
+    formatter = RedactingFormatter(config.auth_data)
+    if config.dashboard_password:
+        formatter.add_secrets(config.dashboard_password)
+    if config.dashboard_session_secret:
+        formatter.add_secrets(config.dashboard_session_secret)
+    handler.setFormatter(formatter)
     logging.basicConfig(level=config.log_level, handlers=[handler], force=True)
+    _active_formatter = formatter
+    return formatter
+
+
+def register_redacted_secret(secret_text: str) -> None:
+    if _active_formatter is not None and secret_text:
+        _active_formatter.add_secrets(secret_text)
 
 
 def install_signal_handlers(stop_event):
@@ -62,7 +101,7 @@ class FileChangedError(RuntimeError):
     pass
 
 
-def file_signature(path):
+def file_signature(path: str | Path) -> FileSignature:
     info = Path(path).lstat()
     if not stat.S_ISREG(info.st_mode):
         raise ValueError(f'Not a regular file: {path}')
@@ -70,8 +109,9 @@ def file_signature(path):
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
 
 
-def is_media(path, root):
+def is_media(path: str | Path, root: str | Path) -> bool:
     """root: the watched folder as written in the paths being checked (not necessarily resolved)."""
+    path = Path(path)
     root = Path(root)
     if path.suffix.lower() not in MEDIA_EXTENSIONS or path.is_symlink():
         return False
@@ -84,7 +124,22 @@ def is_media(path, root):
     return True
 
 
-def wait_until_stable(path, stable_seconds=5, timeout=300, stop_event=None, known=None):
+def _confirmed_media_key(result: Any, path: Path) -> str | None:
+    if not isinstance(result, Mapping):
+        return None
+    media_key = result.get(path.as_posix())
+    if isinstance(media_key, str) and media_key.strip():
+        return media_key
+    return None
+
+
+def wait_until_stable(
+    path: str | Path,
+    stable_seconds: float = 5,
+    timeout: float = 300,
+    stop_event: Event | None = None,
+    known: tuple[FileSignature, float] | None = None,
+) -> FileSignature:
     stop_event = stop_event or Event()
     deadline = time.monotonic() + timeout
     # known=(signature, monotonic time first seen) lets an already-quiet file skip the wait.
@@ -102,13 +157,183 @@ def wait_until_stable(path, stable_seconds=5, timeout=300, stop_event=None, know
     raise InterruptedError('Upload cancelled during shutdown')
 
 
-def upload_file(client, path, stable_seconds=5, stability_timeout=300, stop_event=None,
-                on_confirmed=None, known=None):
+def wait_until_stable_batch(
+    candidates: Sequence[BatchCandidate],
+    stable_seconds: float = 5,
+    stability_timeout: float = 300,
+    stop_event: Event | None = None,
+    known_map: Mapping[str, tuple[FileSignature, float]] | None = None,
+) -> tuple[list[BatchCandidate], list[BatchCandidate], list[tuple[dict[str, Any], Exception]]]:
+    stop_event = stop_event or Event()
+    if stop_event.is_set():
+        raise InterruptedError('Upload cancelled during shutdown')
+    now = time.monotonic()
+    deadline = now + stability_timeout
+    previous: dict[Path, FileSignature] = {}
+    unchanged_since: dict[Path, float] = {}
+    for _, path, signature in candidates:
+        seen = known_map.get(str(path)) if known_map else None
+        if seen is not None and seen[0] == signature:
+            previous[path] = seen[0]
+            unchanged_since[path] = seen[1]
+        else:
+            previous[path] = signature
+            unchanged_since[path] = now
+    pending = list(candidates)
+    ready: list[BatchCandidate] = []
+    changed_deferred: list[BatchCandidate] = []
+    failed: list[tuple[dict[str, Any], Exception]] = []
+
+    while pending and not stop_event.is_set():
+        still_waiting: list[BatchCandidate] = []
+        for job, path, initial_sig in pending:
+            try:
+                signature = file_signature(path)
+            except Exception as error:
+                failed.append((job, error))
+                continue
+            now = time.monotonic()
+            if signature != previous[path]:
+                previous[path] = signature
+                unchanged_since[path] = now
+            if signature[2] > 0 and now - unchanged_since[path] >= stable_seconds:
+                ready.append((job, path, signature))
+            else:
+                still_waiting.append((job, path, initial_sig))
+        pending = still_waiting
+        if not pending:
+            return ready, changed_deferred, failed
+        if ready:
+            # Do not stall ready files behind another file that is still growing or empty.
+            for job, path, initial_sig in pending:
+                if previous[path] != initial_sig:
+                    changed_deferred.append((job, path, previous[path]))
+            return ready, changed_deferred, failed
+        now = time.monotonic()
+        if now >= deadline:
+            for job, path, _ in pending:
+                failed.append((job, TimeoutError(f'File is empty or still changing: {path}')))
+            return ready, changed_deferred, failed
+        stop_event.wait(min(1, max(0.01, stable_seconds / 2), deadline - now))
+    raise InterruptedError('Upload cancelled during shutdown')
+
+
+class BatchProgressTracker:
+    """Thread-safe tracker for concurrent GPMC upload progress events."""
+
+    def __init__(self, batch_size: int, progress_interval: float = 15.0) -> None:
+        self.batch_size = batch_size
+        self.progress_interval = progress_interval
+        self._lock = Lock()
+        self._active_paths: set[str] = set()
+        self._phases: dict[str, str] = {}
+        self._terminal_phases: dict[str, str] = {}
+        self._last_bucket: dict[str, int] = {}
+        self._last_logged_at: dict[str, float] = {}
+        self._max_active = 0
+
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._active_paths)
+
+    @property
+    def max_active(self) -> int:
+        with self._lock:
+            return self._max_active
+
+    def terminal_phase(self, posix_path: str) -> str | None:
+        with self._lock:
+            return self._terminal_phases.get(posix_path)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                'batch_size': self.batch_size,
+                'active': len(self._active_paths),
+                'max_active': self._max_active,
+                'phases': dict(self._phases),
+                'terminal_phases': dict(self._terminal_phases),
+            }
+
+    def handle_event(self, event: Mapping[str, Any]) -> None:
+        if not isinstance(event, Mapping):
+            return
+        phase = str(event.get('phase') or '')
+        if not phase:
+            return
+        path = str(event.get('path') or event.get('filename') or '<unknown>')
+        try:
+            bytes_completed = int(event.get('bytes_completed') or 0)
+        except (TypeError, ValueError):
+            bytes_completed = 0
+        try:
+            bytes_total = int(event.get('bytes_total') or 0)
+        except (TypeError, ValueError):
+            bytes_total = 0
+        percent = min(100, max(0, int(bytes_completed * 100 / bytes_total))) if bytes_total > 0 else 0
+        now = time.monotonic()
+
+        log_level: int | None = None
+        with self._lock:
+            previous_phase = self._phases.get(path)
+            self._phases[path] = phase
+            if phase in ACTIVE_UPLOAD_PHASES:
+                self._active_paths.add(path)
+                if len(self._active_paths) > self._max_active:
+                    self._max_active = len(self._active_paths)
+            elif phase in TERMINAL_UPLOAD_PHASES:
+                self._active_paths.discard(path)
+                self._terminal_phases[path] = phase
+            active = len(self._active_paths)
+
+            if phase == 'uploading':
+                bucket = percent // 25
+                last_bucket = self._last_bucket.get(path, -1)
+                last_logged = self._last_logged_at.get(path, 0.0)
+                if (previous_phase != 'uploading' or bucket > last_bucket
+                        or (now - last_logged >= self.progress_interval and bytes_completed > 0)):
+                    self._last_bucket[path] = max(bucket, last_bucket)
+                    self._last_logged_at[path] = now
+                    log_level = logging.INFO
+            elif phase == 'skipped':
+                if previous_phase != 'skipped':
+                    log_level = logging.INFO
+            elif phase == 'error':
+                if previous_phase != 'error':
+                    log_level = logging.WARNING
+            elif phase != previous_phase:
+                log_level = logging.DEBUG
+
+        if log_level is not None:
+            if phase == 'uploading':
+                logger.log(
+                    log_level,
+                    'Upload progress file=%s phase=%s percent=%d%% bytes=%d/%d active=%d/%d',
+                    path, phase, percent, bytes_completed, bytes_total, active, self.batch_size,
+                )
+            else:
+                logger.log(
+                    log_level,
+                    'Upload progress file=%s phase=%s active=%d/%d',
+                    path, phase, active, self.batch_size,
+                )
+
+
+def upload_file(
+    client: Any,
+    path: str | Path,
+    stable_seconds: float = 5,
+    stability_timeout: float = 300,
+    stop_event: Event | None = None,
+    on_confirmed: Callable[[FileSignature, str], None] | None = None,
+    known: tuple[FileSignature, float] | None = None,
+) -> str:
     path = Path(path).absolute()
     signature = wait_until_stable(path, stable_seconds, stability_timeout, stop_event, known)
     started = time.monotonic()
-    result = client.upload(target=str(path), show_progress=False)
-    media_key = result.get(path.as_posix()) if isinstance(result, dict) else None
+    result = client.upload(target=str(path), show_progress=False, delete_from_host=False)
+    media_key = _confirmed_media_key(result, path)
     if not media_key:
         raise RuntimeError(f'Upload not confirmed: {path}')
     if file_signature(path) != signature:
@@ -120,8 +345,42 @@ def upload_file(client, path, stable_seconds=5, stability_timeout=300, stop_even
 
 
 class FileProcessor:
-    def __init__(self, client, store, delete_after_upload=False, stop_event=None,
-                 max_attempts=5, retry_base=5, retry_max=3600, root=None, **upload_options):
+    def __init__(
+        self,
+        client: Any,
+        store: StateStore,
+        delete_after_upload: bool = False,
+        stop_event: Event | None = None,
+        max_attempts: int = 5,
+        retry_base: float = 5,
+        retry_max: float = 3600,
+        root: str | Path | None = None,
+        allowed_roots: Sequence[str | Path] | None = None,
+        stable_seconds: float = 5,
+        stability_timeout: float = 300,
+        upload_threads: int = 2,
+        upload_batch_size: int = 4,
+        upload_quality: str = 'original',
+        use_quota: bool = False,
+        duplicate_detection: bool = True,
+        filename_conflict_policy: str = 'hash_dedup',
+        auto_retry_failed: bool = True,
+        settings_provider: Callable[[], Mapping[str, Any]] | None = None,
+        client_provider: Callable[[], Any] | None = None,
+        account_client_provider: Callable[[int | None], Any] | None = None,
+        eligible_accounts_provider: Callable[[], Sequence[int]] | None = None,
+        default_account_provider: Callable[[], int | None] | None = None,
+        is_paused: Callable[[], bool] | None = None,
+        on_progress: Callable[[Mapping[str, Any]], None] | None = None,
+        on_batch_start: Callable[[Sequence[BatchCandidate], int], None] | None = None,
+        on_batch_complete: Callable[[dict[str, Any]], None] | None = None,
+        on_file_confirmed: Callable[[dict[str, Any], str, str, float], None] | None = None,
+        on_file_failed: Callable[[dict[str, Any], Exception, int, float, bool], None] | None = None,
+    ) -> None:
+        if upload_threads < 1:
+            raise ValueError('upload_threads must be at least 1')
+        if upload_batch_size < 1:
+            raise ValueError('upload_batch_size must be at least 1')
         self.client = client
         self.store = store
         self.delete_after_upload = delete_after_upload
@@ -129,88 +388,458 @@ class FileProcessor:
         self.max_attempts = max_attempts
         self.retry_base = retry_base
         self.retry_max = retry_max
-        self.upload_options = upload_options
+        self.stable_seconds = stable_seconds
+        self.stability_timeout = stability_timeout
+        self.upload_threads = upload_threads
+        self.upload_batch_size = upload_batch_size
+        self.upload_quality = upload_quality
+        self.use_quota = use_quota
+        self.duplicate_detection = duplicate_detection
+        self.filename_conflict_policy = filename_conflict_policy
+        self.auto_retry_failed = auto_retry_failed
+        self.settings_provider = settings_provider
+        self.client_provider = client_provider
+        self.account_client_provider = account_client_provider
+        self.eligible_accounts_provider = eligible_accounts_provider
+        self.default_account_provider = default_account_provider
+        self.is_paused = is_paused
+        self.on_progress = on_progress
+        self.on_batch_start = on_batch_start
+        self.on_batch_complete = on_batch_complete
+        self.on_file_confirmed = on_file_confirmed
+        self.on_file_failed = on_file_failed
+        self._last_account_id: int | None = None
         self.root = Path(root).resolve() if root is not None else None
-        self.first_seen = {}  # path -> (signature, monotonic time), pending files only
+        self.allowed_roots = (
+            tuple(Path(item).resolve() for item in allowed_roots)
+            if allowed_roots is not None
+            else None
+        )
+        self.first_seen: dict[str, tuple[FileSignature, float]] = {}  # path -> (sig, monotonic time)
         self.seen_lock = Lock()
 
-    def check_path(self, path):
-        if self.root is not None and not path.resolve().is_relative_to(self.root):
+    def _effective_settings(self) -> dict[str, Any]:
+        base = {
+            'delete_after_upload': self.delete_after_upload,
+            'max_attempts': self.max_attempts,
+            'retry_base': self.retry_base,
+            'retry_max': self.retry_max,
+            'stable_seconds': self.stable_seconds,
+            'stability_timeout': self.stability_timeout,
+            'upload_threads': self.upload_threads,
+            'upload_batch_size': self.upload_batch_size,
+            'upload_quality': self.upload_quality,
+            'use_quota': self.use_quota,
+            'duplicate_detection': self.duplicate_detection,
+            'filename_conflict_policy': self.filename_conflict_policy,
+            'auto_retry_failed': self.auto_retry_failed,
+        }
+        if self.settings_provider is not None:
+            overrides = self.settings_provider()
+            for key in base:
+                if key in overrides:
+                    base[key] = overrides[key]
+        return base
+
+    def _current_client(self, account_id: int | None = None) -> Any:
+        if self.account_client_provider is not None:
+            return self.account_client_provider(account_id)
+        if self.client_provider is not None:
+            return self.client_provider()
+        return self.client
+
+    def check_path(self, path: Path) -> None:
+        resolved = path.resolve()
+        if self.allowed_roots is not None:
+            if not any(resolved.is_relative_to(root) for root in self.allowed_roots):
+                raise ValueError('File is outside approved media roots')
+            return
+        if self.root is not None and not resolved.is_relative_to(self.root):
             raise ValueError('File is outside WATCHED_FOLDER')
 
-    def submit(self, path):
+    def _is_excluded_legacy(self, path: Path) -> bool:
+        resolved = path.resolve()
+        if self.allowed_roots is not None:
+            matching = next((r for r in self.allowed_roots if resolved.is_relative_to(r)), None)
+            return matching is not None and not is_media(path, matching)
+        return self.root is not None and not is_media(path, self.root)
+
+    def submit(
+        self,
+        path: str | Path,
+        folder_id: int | None = None,
+        account_id: int | None = None,
+    ) -> bool:
         path = Path(path).absolute()
         try:
             self.check_path(path)
+            settings = self._effective_settings()
             signature = file_signature(path)
+            resolved_account_id = account_id
+            if resolved_account_id is None and folder_id is None and self.default_account_provider is not None:
+                resolved_account_id = self.default_account_provider()
             with self.seen_lock:
-                if self.store.enqueue(path, signature):
+                pending = self.store.enqueue(
+                    path,
+                    signature,
+                    folder_id=folder_id,
+                    file_size=signature[2],
+                    auto_retry_failed=bool(settings['auto_retry_failed']),
+                    account_id=resolved_account_id,
+                )
+                if pending:
                     seen = self.first_seen.get(str(path))
                     if seen is None or seen[0] != signature:
                         self.first_seen[str(path)] = (signature, time.monotonic())
+                return pending
         except FileNotFoundError:
-            pass  # A queued event may refer to a file already moved or removed.
+            return False  # A queued event may refer to a file already moved or removed.
         except OSError as error:
             logger.warning('File skipped until next scan file=%s error=%s', path, type(error).__name__)
+            return False
 
-    def process_once(self):
-        if self.stop_event.is_set():
-            return False
-        job = self.store.next_job()
-        if not job:
-            return False
+    def _record_failure(
+        self,
+        job: dict[str, Any],
+        error: Exception,
+        settings: Mapping[str, Any] | None = None,
+    ) -> None:
+        cfg = settings if settings is not None else self._effective_settings()
+        # Upload confirmation must survive a cleanup failure; superseded entries stay intact.
+        current = self.store.get(job['path'])
+        if current and current['signature'] == job['signature']:
+            attempts, delay, exhausted = self.store.fail(
+                current, error, int(cfg['max_attempts']), float(cfg['retry_base']), float(cfg['retry_max'])
+            )
+            logger.warning(
+                'Original retained file=%s error=%s attempts=%s retry_in=%.1fs cooldown=%s',
+                job['path'], type(error).__name__, attempts, delay, exhausted,
+            )
+            if self.on_file_failed is not None:
+                try:
+                    self.on_file_failed(current, error, attempts, delay, exhausted)
+                except Exception:
+                    pass
+        else:
+            logger.info(
+                'Original retained; queued entry superseded file=%s error=%s',
+                job['path'], type(error).__name__,
+            )
+
+    def _finalize_confirmed_job(
+        self,
+        job: dict[str, Any],
+        settings: Mapping[str, Any],
+        *,
+        duration: float | None = None,
+        result_status: str = 'uploaded',
+    ) -> None:
+        path = Path(job['path'])
+        self.check_path(path)
+        if settings['delete_after_upload']:
+            try:
+                current_signature = file_signature(path)
+            except FileNotFoundError:
+                current_signature = None
+            if current_signature is not None:
+                if list(current_signature) != json.loads(job['signature']):
+                    self.submit(path, folder_id=job.get('folder_id'), account_id=job.get('account_id'))
+                    raise FileChangedError(f'File changed before cleanup: {path}')
+                path.unlink()
+                logger.info('Original removed file=%s', path)
+        self.store.complete(
+            job['path'], job['signature'], duration=duration, result_status=result_status
+        )
+
+    def _process_cleanup_job(self, job: dict[str, Any], settings: Mapping[str, Any]) -> None:
         path = Path(job['path'])
         try:
             self.check_path(path)
-            if self.root is not None and not is_media(path, self.root):
+            if self._is_excluded_legacy(path):
                 # Queued by an older version before hidden/system files were excluded.
                 logger.info('Excluded file skipped file=%s', path)
-                self.store.complete(path, job['signature'])
-                return True
-            logger.info('Processing file=%s attempt=%s operation=%s', path, job['attempts'] + 1,
-                        'cleanup' if job['media_key'] else 'upload')
-            if not job['media_key']:
-                def confirmed(signature, media_key):
-                    nonlocal job
-                    if not self.store.mark_uploaded(job, signature, media_key):
-                        raise FileChangedError(f'File was replaced while queued: {path}')
-                    job = {**job, 'signature': json.dumps(signature), 'media_key': media_key}
-
-                upload_file(self.client, path, stop_event=self.stop_event, on_confirmed=confirmed,
-                            known=self.first_seen.get(str(path)), **self.upload_options)
-            if self.stop_event.is_set():
-                return True  # Keep confirmation durable; resume cleanup after restart.
-            if self.delete_after_upload:
-                self.check_path(path)
-                try:
-                    current_signature = file_signature(path)
-                except FileNotFoundError:
-                    current_signature = None
-                if current_signature is not None:
-                    if list(current_signature) != json.loads(job['signature']):
-                        self.submit(path)
-                        raise FileChangedError(f'File changed before cleanup: {path}')
-                    path.unlink()
-                    logger.info('Original removed file=%s', path)
-            self.store.complete(path, job['signature'])
+                self.store.complete(job['path'], job['signature'])
+                return
+            logger.info('Processing file=%s attempt=%s operation=cleanup', path, job['attempts'] + 1)
+            self._finalize_confirmed_job(job, settings)
         except Exception as error:
             if isinstance(error, InterruptedError) and self.stop_event.is_set():
+                return
+            self._record_failure(job, error, settings)
+
+    def _collect_valid_candidates(
+        self,
+        upload_jobs: Sequence[dict[str, Any]],
+        settings: Mapping[str, Any],
+    ) -> tuple[list[BatchCandidate], int, int]:
+        candidates: list[BatchCandidate] = []
+        changed_candidates: list[BatchCandidate] = []
+        requeued_count = 0
+        failed_count = 0
+        for job in upload_jobs:
+            path = Path(job['path']).absolute()
+            try:
+                self.check_path(path)
+                if self._is_excluded_legacy(path):
+                    # Queued by an older version before hidden/system files were excluded.
+                    logger.info('Excluded file skipped file=%s', path)
+                    self.store.complete(job['path'], job['signature'])
+                    continue
+                current_signature = file_signature(path)
+            except Exception as error:
+                failed_count += 1
+                self._record_failure(job, error, settings)
+                continue
+            if list(current_signature) != json.loads(job['signature']):
+                with self.seen_lock:
+                    self.first_seen.pop(str(path), None)
+                self.store.enqueue(
+                    job['path'],
+                    current_signature,
+                    folder_id=job.get('folder_id'),
+                    file_size=current_signature[2],
+                    account_id=job.get('account_id'),
+                )
+                logger.info('File changed since queued; requeued file=%s', path)
+                requeued_count += 1
+                updated_job = self.store.get(job['path']) or {
+                    **job,
+                    'signature': json.dumps(current_signature),
+                    'file_size': current_signature[2],
+                }
+                changed_candidates.append((updated_job, path, current_signature))
+                continue
+            candidates.append((job, path, current_signature))
+        # If other unchanged files are ready in this batch, upload them now and leave changed files requeued.
+        # For a solo changed file, wait the full stability window from now rather than reusing stale first_seen.
+        if not candidates and len(upload_jobs) == 1 and changed_candidates:
+            return changed_candidates, 0, failed_count
+        return candidates, requeued_count, failed_count
+
+    def _execute_upload_batch(
+        self,
+        ready: Sequence[BatchCandidate],
+        settings: Mapping[str, Any],
+        client: Any,
+    ) -> None:
+        effective_threads = min(int(settings['upload_threads']), len(ready))
+        tracker = BatchProgressTracker(batch_size=len(ready))
+
+        def handle_progress(event: Mapping[str, Any]) -> None:
+            tracker.handle_event(event)
+            if self.on_progress is not None:
+                try:
+                    self.on_progress(event)
+                except Exception:
+                    pass
+
+        if self.on_batch_start is not None:
+            try:
+                self.on_batch_start(ready, effective_threads)
+            except Exception:
+                pass
+
+        logger.info('Starting upload batch size=%d threads=%d', len(ready), effective_threads)
+        for job, path, _ in ready:
+            logger.info('Processing file=%s attempt=%s operation=upload', path, job['attempts'] + 1)
+        started = time.monotonic()
+        # Pass a Path->None mapping so one vanished file or OS MIME gap cannot abort the whole batch.
+        target: dict[Path, None] = {path: None for _, path, _ in ready}
+        upload_kwargs: dict[str, Any] = {
+            'target': target,
+            'show_progress': False,
+            'threads': effective_threads,
+            'delete_from_host': False,
+            'progress_callback': handle_progress,
+        }
+        if settings['upload_quality'] == 'saver':
+            upload_kwargs['saver'] = True
+        if settings['use_quota']:
+            upload_kwargs['use_quota'] = True
+        if not settings['duplicate_detection']:
+            upload_kwargs['force_upload'] = True
+        if settings['filename_conflict_policy'] == 'skip_existing_filename':
+            upload_kwargs['skip_existing_filenames'] = True
+
+        try:
+            result = client.upload(**upload_kwargs)
+        except Exception as error:
+            if isinstance(error, InterruptedError) and self.stop_event.is_set():
+                return
+            duration = time.monotonic() - started
+            logger.warning(
+                'Batch upload failed size=%d threads=%d error=%s duration=%.2fs',
+                len(ready), effective_threads, type(error).__name__, duration,
+            )
+            for job, _, _ in ready:
+                self._record_failure(job, error, settings)
+            if self.on_batch_complete is not None:
+                try:
+                    self.on_batch_complete({
+                        'size': len(ready), 'confirmed': 0, 'failed': len(ready),
+                        'deferred': 0, 'max_active': tracker.max_active, 'duration': duration,
+                        'error': type(error).__name__,
+                    })
+                except Exception:
+                    pass
+            return
+
+        batch_duration = time.monotonic() - started
+        confirmed_count = 0
+        failed_count = 0
+        deferred_count = 0
+        for job, path, stable_sig in ready:
+            active_job = job
+            try:
+                media_key = _confirmed_media_key(result, path)
+                if not media_key:
+                    raise RuntimeError(f'Upload not confirmed: {path}')
+                if file_signature(path) != stable_sig:
+                    raise FileChangedError(f'File changed during upload; original retained: {path}')
+                if not self.store.mark_uploaded(active_job, stable_sig, media_key):
+                    raise FileChangedError(f'File was replaced while queued: {path}')
+                active_job = {
+                    **active_job,
+                    'signature': json.dumps(stable_sig),
+                    'media_key': media_key,
+                    'file_size': stable_sig[2],
+                }
+                terminal = tracker.terminal_phase(path.as_posix())
+                result_status = 'skipped' if terminal == 'skipped' else 'uploaded'
+                logger.info(
+                    'Upload confirmed file=%s status=%s duration=%.2fs',
+                    path, 'duplicate' if result_status == 'skipped' else 'uploaded', batch_duration,
+                )
+                confirmed_count += 1
+                if self.on_file_confirmed is not None:
+                    try:
+                        self.on_file_confirmed(active_job, media_key, result_status, batch_duration)
+                    except Exception:
+                        pass
+                if self.stop_event.is_set():
+                    deferred_count += 1
+                    continue  # Keep confirmation durable; resume cleanup/completion after restart.
+                self._finalize_confirmed_job(
+                    active_job, settings, duration=batch_duration, result_status=result_status
+                )
+            except Exception as error:
+                if isinstance(error, InterruptedError) and self.stop_event.is_set():
+                    deferred_count += 1
+                    continue
+                failed_count += 1
+                self._record_failure(active_job, error, settings)
+
+        logger.info(
+            'Batch completed size=%d confirmed=%d failed=%d deferred=%d max_active=%d duration=%.2fs',
+            len(ready), confirmed_count, failed_count, deferred_count, tracker.max_active, batch_duration,
+        )
+        if self.on_batch_complete is not None:
+            try:
+                self.on_batch_complete({
+                    'size': len(ready), 'confirmed': confirmed_count, 'failed': failed_count,
+                    'deferred': deferred_count, 'max_active': tracker.max_active,
+                    'duration': batch_duration,
+                })
+            except Exception:
+                pass
+
+    def process_once(self) -> bool:
+        if self.stop_event.is_set():
+            return False
+        if self.is_paused is not None and self.is_paused():
+            return False
+        settings = self._effective_settings()
+        batch_size = max(1, int(settings['upload_batch_size']))
+        if self.eligible_accounts_provider is not None:
+            eligible = list(self.eligible_accounts_provider())
+            jobs = self.store.next_jobs(
+                batch_size,
+                eligible_account_ids=eligible,
+                last_account_id=self._last_account_id,
+            )
+        else:
+            jobs = self.store.next_jobs(batch_size)
+        if not jobs:
+            return False
+
+        cleanup_jobs = [job for job in jobs if job['media_key']]
+        upload_jobs = [job for job in jobs if not job['media_key']]
+        touched_paths = [str(Path(job['path']).absolute()) for job in jobs]
+
+        try:
+            for job in cleanup_jobs:
+                if self.stop_event.is_set():
+                    return True
+                self._process_cleanup_job(job, settings)
+
+            if not upload_jobs or self.stop_event.is_set():
                 return True
-            # Upload confirmation must survive a cleanup failure.
-            current = self.store.get(path)
-            if current and current['signature'] == job['signature']:
-                attempts, delay, exhausted = self.store.fail(
-                    current, error, self.max_attempts, self.retry_base, self.retry_max)
-                logger.warning('Original retained file=%s error=%s attempts=%s retry_in=%.1fs cooldown=%s',
-                               path, type(error).__name__, attempts, delay, exhausted)
+
+            # Guarantee strict single-account isolation within every GPMC batch call.
+            batch_account_id = upload_jobs[0].get('account_id')
+            if batch_account_id is not None:
+                upload_jobs = [job for job in upload_jobs if job.get('account_id') == batch_account_id]
+                self._last_account_id = int(batch_account_id)
+
+            client = self._current_client(batch_account_id)
+            if client is None:
+                # Authentication is not ready; keep jobs pending until valid credentials are active.
+                return False
+
+            candidates, requeued_count, pre_failed = self._collect_valid_candidates(upload_jobs, settings)
+            if not candidates:
+                if (requeued_count > 0 and not cleanup_jobs and pre_failed == 0
+                        and float(settings['stable_seconds']) > 0):
+                    self.stop_event.wait(min(0.5, float(settings['stable_seconds'])))
+                return True
+
+            with self.seen_lock:
+                known_map = {
+                    str(path): self.first_seen[str(path)]
+                    for _, path, _ in candidates
+                    if str(path) in self.first_seen
+                }
+
+            try:
+                ready, changed_deferred, stability_failed = wait_until_stable_batch(
+                    candidates,
+                    float(settings['stable_seconds']),
+                    float(settings['stability_timeout']),
+                    self.stop_event,
+                    known_map=known_map,
+                )
+            except InterruptedError:
+                if self.stop_event.is_set():
+                    return True
+                raise
+
+            for job, error in stability_failed:
+                self._record_failure(job, error, settings)
+            for job, path, new_signature in changed_deferred:
+                with self.seen_lock:
+                    self.first_seen.pop(str(path), None)
+                self.store.enqueue(
+                    job['path'],
+                    new_signature,
+                    folder_id=job.get('folder_id'),
+                    file_size=new_signature[2],
+                    account_id=job.get('account_id'),
+                )
+                logger.info('File changed while waiting for stability; requeued file=%s', path)
+
+            if not ready or self.stop_event.is_set():
+                return True
+
+            self._execute_upload_batch(ready, settings, client)
+            return True
         finally:
             with self.seen_lock:
-                current = self.store.get(path)
-                if not current or current['status'] != 'pending':
-                    self.first_seen.pop(str(path), None)
-        return True
+                for path_str in touched_paths:
+                    current = self.store.get(path_str)
+                    if not current or current['status'] != 'pending':
+                        self.first_seen.pop(path_str, None)
 
-    def run(self):
+    def run(self) -> None:
         try:
             while not self.stop_event.is_set():
                 if not self.process_once():
@@ -269,9 +898,11 @@ class PhotoHandler(FileSystemEventHandler):
 
 
 class WatchSupervisor:
-    def __init__(self, root, submit, poll_interval=1):
+    def __init__(self, root: str | Path, submit: Callable[[Path], Any], poll_interval: float = 1, recursive: bool = True) -> None:
         self.root = Path(root)
-        self.handler = PhotoHandler(submit, root)
+        self.submit = submit
+        self.recursive = recursive
+        self.handler = PhotoHandler(lambda path: self.submit(path), root)
         self.poll_interval = poll_interval
         self.observer = None
         self.identity = None
@@ -300,12 +931,12 @@ class WatchSupervisor:
                 return True
             self.stop()
             self.observer = Observer(timeout=self.poll_interval)
-            self.observer.schedule(self.handler, str(self.root), recursive=True)
+            self.observer.schedule(self.handler, str(self.root), recursive=self.recursive)
             self.observer.start()
             self.identity = identity
             self.generation += 1
             self.last_error = None
-            logger.info('Monitoring active folder=%s', self.root)
+            logger.info('Monitoring active folder=%s recursive=%s', self.root, self.recursive)
             return True
         except OSError as error:
             self.stop()
@@ -342,14 +973,17 @@ def run_service(config, client_factory, stop_event):
         client, store, delete_after_upload=config.delete_after_upload,
         stop_event=stop_event, root=watched_folder,
         stable_seconds=config.stable_seconds, stability_timeout=config.stability_timeout,
-        max_attempts=config.max_attempts, retry_base=config.retry_base, retry_max=config.retry_max)
+        max_attempts=config.max_attempts, retry_base=config.retry_base, retry_max=config.retry_max,
+        upload_threads=config.upload_threads, upload_batch_size=config.upload_batch_size)
     worker = Thread(target=processor.run, name='upload-worker', daemon=True)
     supervisor = WatchSupervisor(watched_folder, processor.submit, config.poll_interval)
     next_scan = 0
     try:
         worker.start()
-        logger.info('Service started folder=%s delete_after_upload=%s',
-                    watched_folder, config.delete_after_upload)
+        logger.info(
+            'Service started folder=%s delete_after_upload=%s upload_threads=%s upload_batch_size=%s',
+            watched_folder, config.delete_after_upload, config.upload_threads, config.upload_batch_size,
+        )
         while not processor.stop_event.is_set():
             if not worker.is_alive():
                 raise RuntimeError('Upload worker stopped unexpectedly')
@@ -400,6 +1034,11 @@ def main():
         logger.error('Configuration error: %s', error)
         return 2
     configure_logging(config)
+    if config.dashboard_enabled:
+        from api_server import run_dashboard_server
+
+        return run_dashboard_server(config)
+
     # GPMC changes SIGINT when imported; install our handlers afterwards.
     from gpmc import Client
 

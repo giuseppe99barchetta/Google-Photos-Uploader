@@ -1,0 +1,84 @@
+# Optional Immich stack overlay for running Immich alongside Google Photos Sync Manager.
+# Start both together with:
+#   docker compose -f docker-compose.yml -f compose.override.yaml -f docker-compose.immich.yml up -d --build
+#
+# Immich Web UI & Mobile App endpoint: http://localhost:2283 (or http://<your-pc-ip>:2283)
+# Google Photos Sync Manager Dashboard: http://localhost:8080
+
+services:
+  gphotos-uploader:
+    depends_on:
+      immich-server:
+        condition: service_started
+    environment:
+      APPROVED_MEDIA_ROOTS: ${APPROVED_MEDIA_ROOTS:-/data,/media/immich}
+      IMMICH_URL: ${IMMICH_URL:-http://immich-server:2283}
+      IMMICH_PUBLIC_URL: ${IMMICH_PUBLIC_URL:-http://localhost:2283}
+      IMMICH_MEDIA_ROOT: /media/immich
+    volumes:
+      - type: bind
+        source: ${IMMICH_UPLOAD_LOCATION:-./immich-library}
+        target: /media/immich
+        read_only: true
+
+  immich-server:
+    container_name: immich_server
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
+    restart: unless-stopped
+    ports:
+      - "${IMMICH_BIND_HOST:-0.0.0.0}:${IMMICH_PORT:-2283}:2283"
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      DB_HOSTNAME: database
+      DB_USERNAME: ${IMMICH_DB_USERNAME:-postgres}
+      DB_PASSWORD: ${IMMICH_DB_PASSWORD:-immichpostgres}
+      DB_DATABASE_NAME: ${IMMICH_DB_DATABASE_NAME:-immich}
+      REDIS_HOSTNAME: redis
+    volumes:
+      - ${IMMICH_UPLOAD_LOCATION:-./immich-library}:/data
+    depends_on:
+      - redis
+      - database
+    healthcheck:
+      disable: false
+
+  immich-machine-learning:
+    container_name: immich_machine_learning
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-release}
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      MACHINE_LEARNING_MODEL_REVISION: v2
+    volumes:
+      - immich-model-cache:/cache
+    healthcheck:
+      disable: false
+
+  redis:
+    container_name: immich_redis
+    image: docker.io/valkey/valkey:9
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  database:
+    container_name: immich_postgres
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
+    restart: unless-stopped
+    shm_size: 128mb
+    environment:
+      POSTGRES_USER: ${IMMICH_DB_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${IMMICH_DB_PASSWORD:-immichpostgres}
+      POSTGRES_DB: ${IMMICH_DB_DATABASE_NAME:-immich}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - immich-postgres:/var/lib/postgresql/data
+    healthcheck:
+      disable: false
+
+volumes:
+  immich-postgres:
+  immich-model-cache:

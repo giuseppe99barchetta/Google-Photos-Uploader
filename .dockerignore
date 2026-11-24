@@ -1,7 +1,17 @@
-# Only runtime source and dependencies belong in the build context.
-**
+*
 !Dockerfile
 !requirements.txt
+!api_server.py
+!auth_manager.py
+!event_hub.py
+!folder_manager.py
+!immich_manager.py
 !script_gphoto.py
+!security.py
+!sync_service.py
 !upload_state.py
 !uploader_config.py
+!frontend/
+!frontend/**
+frontend/node_modules
+frontend/dist

@@ -1,50 +1,41 @@
-# Stage 1: Build dependencies (multi-stage build)
+FROM node:22-alpine AS frontend-builder
+
+WORKDIR /frontend
+COPY frontend/package.json ./
+RUN npm install --no-audit --no-fund
+COPY frontend/ ./
+RUN npm run build
+
 FROM python:3.11-alpine AS builder
 
-WORKDIR /app
+WORKDIR /build
+COPY requirements.txt ./
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /wheels -r requirements.txt
 
-# Install system dependencies required for build
-RUN apk add --no-cache \
-    gcc \
-    musl-dev \
-    linux-headers
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
-
-# Stage 2: Final image
 FROM python:3.11-alpine
 
-# Copy dependencies from the build stage into a location readable by appuser
-COPY --from=builder /install /usr/local
-
-# Configure non-root user
-RUN adduser -D -u 1000 appuser && \
-    mkdir /data /state && \
-    chown appuser:appuser /data /state && \
-    chmod 700 /state
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/state
 
 WORKDIR /app
 
-# Copy only necessary files
-COPY script_gphoto.py upload_state.py uploader_config.py ./
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir --no-index --find-links=/wheels /wheels/*.whl \
+    && rm -rf /wheels \
+    && addgroup -g 1000 appuser \
+    && adduser -D -u 1000 -G appuser appuser \
+    && mkdir -p /data /state \
+    && chown appuser:appuser /data /state
+
+COPY api_server.py auth_manager.py event_hub.py folder_manager.py immich_manager.py script_gphoto.py security.py sync_service.py upload_state.py uploader_config.py ./
+COPY --from=frontend-builder /frontend/dist ./frontend/dist
+
+EXPOSE 8080
 
 USER appuser
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app \
-    WATCHED_FOLDER=/data \
-    STATE_DIR=/state \
-    HOME=/state
 
-# GPMC can write its cache and failure log here without elevated permissions.
-WORKDIR /state
-
-# Fail the build if the runtime user cannot import the application dependencies.
-RUN python -m pip check && \
-    python -c "import script_gphoto; from gpmc import Client"
-
-HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["python", "/app/script_gphoto.py", "--healthcheck"]
 
-CMD ["python", "-u", "/app/script_gphoto.py"]
+ENTRYPOINT ["python", "-u", "/app/script_gphoto.py"]

@@ -1,5 +1,6 @@
 services:
   gphotos-uploader:
+    build: .
     image: ghcr.io/giuseppe99barchetta/google-photos-uploader:latest
     container_name: gphotos-uploader
     restart: unless-stopped
@@ -9,8 +10,11 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    ports:
+      - "${DASHBOARD_BIND_HOST:-127.0.0.1}:${DASHBOARD_PORT:-8080}:8080"
     environment:
       WATCHED_FOLDER: /data
+      APPROVED_MEDIA_ROOTS: ${APPROVED_MEDIA_ROOTS:-/data}
       STATE_DIR: /state
       HOME: /state
       AUTH_DATA: ${AUTH_DATA:-}
@@ -21,10 +25,24 @@ services:
       SCAN_INTERVAL: ${SCAN_INTERVAL:-60}
       POLL_INTERVAL: ${POLL_INTERVAL:-30}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-60}
+      UPLOAD_THREADS: ${UPLOAD_THREADS:-2}
+      UPLOAD_BATCH_SIZE: ${UPLOAD_BATCH_SIZE:-4}
+      UPLOAD_QUALITY: ${UPLOAD_QUALITY:-original}
+      USE_QUOTA: ${USE_QUOTA:-false}
+      DUPLICATE_DETECTION: ${DUPLICATE_DETECTION:-true}
+      FILENAME_CONFLICT_POLICY: ${FILENAME_CONFLICT_POLICY:-hash_dedup}
+      AUTO_RETRY_FAILED: ${AUTO_RETRY_FAILED:-true}
       MAX_ATTEMPTS: ${MAX_ATTEMPTS:-5}
       RETRY_BASE: ${RETRY_BASE:-5}
       RETRY_MAX: ${RETRY_MAX:-3600}
       SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-120}
+      DASHBOARD_ENABLED: ${DASHBOARD_ENABLED:-true}
+      DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_PORT: 8080
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-admin}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
+      DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:-}
+      DASHBOARD_SECURE_COOKIES: ${DASHBOARD_SECURE_COOKIES:-false}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - type: bind
@@ -32,6 +50,14 @@ services:
         target: /data
         bind:
           create_host_path: false
+      # To monitor additional Windows folders, add read-only bind mounts in compose.override.yaml
+      # (or here) and list their container paths in APPROVED_MEDIA_ROOTS, for example:
+      # - type: bind
+      #   source: C:\Users\you\Pictures
+      #   target: /media/pictures
+      #   read_only: true
+      #   bind:
+      #     create_host_path: false
       - uploader-state:/state
     # If necessary, specify the UID/GID of the user for file permissions
     # user: "1000:1000"

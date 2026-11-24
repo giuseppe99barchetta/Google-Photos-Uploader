@@ -98,16 +98,32 @@ runs read the same environment variables. Invalid values fail before workers sta
 | `SCAN_INTERVAL` | `60` | Interval between reconciliation scans |
 | `POLL_INTERVAL` | `30` | Watchdog polling interval; each poll reads every file's metadata |
 | `REQUEST_TIMEOUT` | `60` | Per-request timeout passed to GPMC; its internal retries can extend an operation |
+| `UPLOAD_THREADS` | `2` | Concurrent upload threads per GPMC batch (`1`–`8`) |
+| `UPLOAD_BATCH_SIZE` | `4` | Maximum pending files collected per GPMC batch (`1`–`64`) |
+| `APPROVED_MEDIA_ROOTS` | `/data` | Comma-separated container mount roots exposed to the dashboard folder browser |
+| `UPLOAD_QUALITY` | `original` | `original` or `saver` (Storage Saver) |
+| `USE_QUOTA` | `false` | Whether to count uploads against Google account storage quota |
+| `DUPLICATE_DETECTION` | `true` | Enable GPMC SHA-1 hash duplicate lookup |
+| `FILENAME_CONFLICT_POLICY` | `hash_dedup` | `hash_dedup` or `skip_existing_filename` |
+| `AUTO_RETRY_FAILED` | `true` | Automatically reactivate failed jobs after cooldown during reconciliation |
+| `DASHBOARD_ENABLED` | `true` (Compose) / `false` (CLI) | Serve the FastAPI + React web dashboard in the same process |
+| `DASHBOARD_BIND_HOST` | `127.0.0.1` | Host interface bound by Compose (`0.0.0.0` for trusted LAN access) |
+| `DASHBOARD_PORT` | `8080` | Host port mapped to the dashboard |
+| `DASHBOARD_USERNAME` | `admin` | Local dashboard administrator username |
+| `DASHBOARD_PASSWORD` | empty | Optional initial password (>= 8 chars); if blank, first-visit setup prompts for one |
+| `DASHBOARD_SESSION_SECRET` | empty | Optional hex signing secret for session cookies (auto-generated in `/state` if blank) |
+| `DASHBOARD_SECURE_COOKIES` | `false` | Set `true` when serving behind an HTTPS reverse proxy |
 | `MAX_ATTEMPTS` | `5` | Failed attempts before cooldown |
 | `RETRY_BASE` | `5` | Initial retry delay |
 | `RETRY_MAX` | `3600` | Maximum retry delay and cooldown duration |
 | `SHUTDOWN_TIMEOUT` | `120` | Grace period for in-flight work before forced process exit |
 | `LOG_LEVEL` | `INFO` | DEBUG, INFO, WARNING, ERROR or CRITICAL |
 
-All durations are in seconds and must be positive. `MAX_ATTEMPTS` and
-`REQUEST_TIMEOUT` must be integers. `STABILITY_TIMEOUT` must be at least
-`STABLE_SECONDS`; `RETRY_MAX` must be at least `RETRY_BASE`. If you increase
-`SHUTDOWN_TIMEOUT`, also increase Compose's `stop_grace_period` (default: 150s).
+All durations are in seconds and must be positive. `MAX_ATTEMPTS`,
+`REQUEST_TIMEOUT`, `UPLOAD_THREADS` (`1`–`8`), and `UPLOAD_BATCH_SIZE` (`1`–`64`)
+must be integers. `STABILITY_TIMEOUT` must be at least `STABLE_SECONDS`;
+`RETRY_MAX` must be at least `RETRY_BASE`. If you increase `SHUTDOWN_TIMEOUT`,
+also increase Compose's `stop_grace_period` (default: 150s).
 
 `WATCHED_FOLDER` and `STATE_DIR` default to `/data` and `/state` in the container.
 They must be separate, non-overlapping directories. Compose fixes them to match
@@ -166,6 +182,86 @@ check upload confirmation and retry messages in the logs.
 SIGINT and SIGTERM request an orderly stop. Work and confirmations remain in
 SQLite. An in-flight GPMC operation may finish within `SHUTDOWN_TIMEOUT`; after
 that the process exits and the next startup resumes pending work.
+
+## Web Dashboard & Sync Manager
+
+The container runs a single unified Python process combining the uploader worker,
+folder watchers, FastAPI REST/SSE API, and React web dashboard (bound to
+`http://localhost:8080` by default).
+
+- **First visit:** if `DASHBOARD_PASSWORD` is unset, the dashboard prompts you
+  once to create an administrator password (minimum 8 characters). Password
+  hashes and session signing keys are stored with `0600` permissions in
+  `/state/dashboard_auth.json` (never in SQLite).
+- **Adding additional Windows folders safely:** mount extra host directories in
+  `compose.override.yaml` (recommended read-only when `DELETE_AFTER_UPLOAD=false`)
+  and include their container mount points in `APPROVED_MEDIA_ROOTS`:
+
+  ```yaml
+  services:
+    gphotos-uploader:
+      environment:
+        APPROVED_MEDIA_ROOTS: /data,/media/pictures,/media/videos
+      volumes:
+        - type: bind
+          source: C:\Users\you\Pictures
+          target: /media/pictures
+          read_only: true
+          bind:
+            create_host_path: false
+        - type: bind
+          source: C:\Users\you\Videos
+          target: /media/videos
+          read_only: true
+          bind:
+            create_host_path: false
+  ```
+
+  After restarting Compose, open **Monitored Folders -> Add Monitored Folder**
+  and browse inside `/data`, `/media/pictures`, or `/media/videos`. Paths outside
+  `APPROVED_MEDIA_ROOTS` and `..` traversal attempts are rejected server-side.
+
+- **Bundled Immich stack & multi-user auto-sync (`docker-compose.immich.yml`):**
+  1. Set a strong alphanumeric `IMMICH_DB_PASSWORD` and your desired
+     `IMMICH_UPLOAD_LOCATION` (e.g. `C:\Users\you\immich-library`) in `.env`.
+  2. Start Immich and Google Photos Sync Manager together with one command:
+     ```cmd
+     docker compose -f docker-compose.yml -f compose.override.yaml -f docker-compose.immich.yml up -d --build
+     ```
+     This starts Immich at `http://localhost:2283` (PostgreSQL with VectorChord,
+     Valkey, Machine Learning, and Immich Server) and automatically mounts
+     Immich's storage **read-only** into Sync Manager at `/media/immich`.
+  3. Open Immich (`http://localhost:2283`), create your admin user (User A), and
+     generate an Admin API key (**Account Settings → API Keys → New API Key**).
+  4. Open Sync Manager (`http://localhost:8080`) → **Google Accounts** to connect
+     Account A and Account B (each needs its own captured Android `AUTH_DATA`;
+     both can share the same device `androidId`).
+  5. Open **Immich Sync** in Sync Manager, paste your Immich Admin API key
+     (saved with `0600` permissions in `/state/immich_api.secret`), create User B
+     if needed, and click **Link & Auto-Sync** next to each Immich user to bind
+     User A → Account A and User B → Account B. Immich's `thumbs`,
+     `encoded-video`, `profile`, and `backups` directories are excluded
+     automatically, and Sync Manager activates watching as soon as each user
+     uploads their first photo from the Immich mobile app.
+
+- **Updating Android authentication securely:**
+  - *From the Dashboard:* open **Authentication**, paste fresh `AUTH_DATA`, click
+    **Validate Credentials**, then **Validate & Save**. The backend validates
+    against Google first (preserving working credentials if validation fails),
+    writes atomically with `0600` permissions to `/state/auth_override.secret`
+    (never modifying read-only `/run/secrets/gphotos_auth`), and reloads the
+    client for the next batch.
+  - *From the Windows host:* replace `secrets\auth_data.txt`, remove any
+    `/state/auth_override.secret` override if present, and restart the container.
+
+- **Backup and recovery:** schema upgrades automatically create a pre-migration
+  SQLite online backup (`uploads.backup-v1-to-v2-*.db`) inside the
+  `uploader-state` volume. You can also take an on-demand backup without stopping
+  the service:
+
+  ```cmd
+  docker compose exec gphotos-uploader python -c "import sqlite3; s=sqlite3.connect('/state/uploads.db'); d=sqlite3.connect('/state/uploads-manual-backup.db'); s.backup(d); d.close(); s.close()"
+  ```
 
 ## How to get your authentication data
 
