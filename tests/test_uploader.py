@@ -1,18 +1,23 @@
 import os
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
+from threading import Barrier, Event
 from unittest.mock import Mock, patch
 
 from watchdog.events import FileCreatedEvent, FileMovedEvent
 
 from script_gphoto import (
+    BatchProgressTracker,
     FileChangedError,
     FileProcessor,
     PhotoHandler,
     discover_files,
+    file_signature,
     wait_until_stable,
+    wait_until_stable_batch,
 )
 from script_gphoto import (
     upload_file as real_upload_file,
@@ -76,7 +81,6 @@ class UploadSafetyTests(unittest.TestCase):
             wait_until_stable(self.path, stable_seconds=0, timeout=0.01)
 
     def test_stability_wait_can_be_cancelled(self):
-        from threading import Event
         stop = Event()
         stop.set()
         with self.assertRaises(InterruptedError):
@@ -205,6 +209,70 @@ class UploadSafetyTests(unittest.TestCase):
         processor.submit(self.path)
         processor.process_once()
         self.assertEqual(client.upload.call_count, 2)
+
+    def test_batch_progress_tracker_is_thread_safe(self):
+        tracker = BatchProgressTracker(batch_size=4, progress_interval=0)
+        barrier = Barrier(2)
+
+        def emit_events(name, terminal):
+            path = f'/data/{name}'
+            tracker.handle_event({'phase': 'hashing', 'path': path, 'bytes_completed': 10, 'bytes_total': 100})
+            tracker.handle_event({'phase': 'uploading', 'path': path, 'bytes_completed': 50, 'bytes_total': 100})
+            barrier.wait(timeout=5)
+            tracker.handle_event({'phase': 'uploading', 'path': path, 'bytes_completed': 100, 'bytes_total': 100})
+            tracker.handle_event({'phase': terminal, 'path': path, 'bytes_completed': 100, 'bytes_total': 100})
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(emit_events, 'a.jpg', 'complete')
+            f2 = pool.submit(emit_events, 'b.jpg', 'skipped')
+            f1.result()
+            f2.result()
+
+        snapshot = tracker.snapshot()
+        self.assertEqual(snapshot['active'], 0)
+        self.assertEqual(snapshot['max_active'], 2)
+        self.assertEqual(tracker.terminal_phase('/data/a.jpg'), 'complete')
+        self.assertEqual(tracker.terminal_phase('/data/b.jpg'), 'skipped')
+
+    def test_wait_until_stable_batch_cancels_on_shutdown(self):
+        stop = Event()
+        stop.set()
+        job = {'path': str(self.path)}
+        with self.assertRaises(InterruptedError):
+            wait_until_stable_batch([(job, self.path, file_signature(self.path))], stop_event=stop)
+
+    def test_wait_until_stable_batch_defers_changing_file_without_stalling_ready_files(self):
+        other = self.path.with_name('other.jpg')
+        other.write_bytes(b'other photo')
+        clock = [0.0]
+        stop = Mock()
+        stop.is_set.return_value = False
+
+        def advance(seconds):
+            clock[0] += seconds
+            if clock[0] == 1.0:
+                other.write_bytes(other.read_bytes() + b'more bytes')
+
+        stop.wait.side_effect = advance
+        candidates = [
+            ({'path': str(self.path)}, self.path, file_signature(self.path)),
+            ({'path': str(other)}, other, file_signature(other)),
+        ]
+        with patch('script_gphoto.time.monotonic', side_effect=lambda: clock[0]):
+            ready, changed_deferred, failed = wait_until_stable_batch(
+                candidates, stable_seconds=2, stability_timeout=10, stop_event=stop,
+            )
+        self.assertEqual([path for _, path, _ in ready], [self.path])
+        self.assertEqual([path for _, path, _ in changed_deferred], [other])
+        self.assertEqual(failed, [])
+
+    def test_processor_rejects_invalid_batch_or_thread_settings(self):
+        store = StateStore(':memory:')
+        self.addCleanup(store.close)
+        with self.assertRaises(ValueError):
+            FileProcessor(Mock(), store, upload_threads=0)
+        with self.assertRaises(ValueError):
+            FileProcessor(Mock(), store, upload_batch_size=0)
 
 
 if __name__ == '__main__':

@@ -48,7 +48,7 @@ class LifecycleTests(unittest.TestCase):
 
         def upload(target, **kwargs):
             stop.set()
-            return {Path(target).as_posix(): 'key'}
+            return {Path(p).as_posix(): 'key' for p in target}
 
         client.upload.side_effect = upload
         config = Config.from_env({**self.env, 'DELETE_AFTER_UPLOAD': 'true'})
@@ -64,6 +64,55 @@ class LifecycleTests(unittest.TestCase):
         FileProcessor(client, store, delete_after_upload=True).process_once()
         self.assertFalse(photo.exists())
         client.upload.assert_called_once()
+
+    def test_graceful_shutdown_mid_batch_persists_confirmations_and_resumes_unconfirmed(self):
+        photos = [self.photos / f'batch_{i}.jpg' for i in range(4)]
+        for index, photo in enumerate(photos):
+            photo.write_bytes(f'photo-{index}'.encode())
+        stop = Event()
+        client = Mock()
+        first_batch_confirmed = []
+
+        def upload_partial_then_stop(target, **kwargs):
+            batch = list(target)
+            stop.set()
+            first_batch_confirmed.extend(batch[:2])
+            return {Path(p).as_posix(): f'key-{Path(p).name}' for p in batch[:2]}
+
+        client.upload.side_effect = upload_partial_then_stop
+        config = Config.from_env({**self.env, 'RETRY_BASE': '0.001', 'RETRY_MAX': '0.001'})
+        run_service(config, Mock(return_value=client), stop)
+        self.assertFalse(healthcheck(self.state))
+        self.assertGreaterEqual(len(first_batch_confirmed), 1)
+
+        store = StateStore(self.state / 'uploads.db')
+        self.addCleanup(store.close)
+        confirmed_set = {p.resolve() for p in first_batch_confirmed}
+        for photo in photos:
+            self.assertTrue(photo.exists())
+            job = store.get(photo)
+            if job is not None and photo.resolve() in confirmed_set:
+                self.assertEqual(job['media_key'], f'key-{photo.name}')
+                self.assertEqual(job['status'], 'pending')
+
+        resumed_targets = []
+
+        def upload_remaining(target, **kwargs):
+            resumed_targets.extend(Path(p).resolve() for p in target)
+            return {Path(p).as_posix(): f'resumed-{Path(p).name}' for p in target}
+
+        client.upload.side_effect = upload_remaining
+        processor = FileProcessor(client, store, stable_seconds=0, retry_base=0, retry_max=0)
+        for photo in photos:
+            processor.submit(photo)
+        with patch('upload_state.time.time', return_value=time.time() + 10):
+            while processor.process_once():
+                pass
+
+        self.assertTrue(confirmed_set.isdisjoint(resumed_targets))
+        for photo in photos:
+            self.assertEqual(store.get(photo)['status'], 'done')
+            self.assertTrue(photo.exists())
 
     def test_known_tokens_are_redacted_in_log_messages(self):
         formatter = RedactingFormatter(FAKE_AUTH)
@@ -85,7 +134,7 @@ class LifecycleTests(unittest.TestCase):
         def slow_upload(target, **kwargs):
             stop.set()
             release.wait(5)
-            return {Path(target).as_posix(): 'key'}
+            return {Path(p).as_posix(): 'key' for p in target}
 
         def track_thread(*args, **kwargs):
             thread = Thread(*args, **kwargs)

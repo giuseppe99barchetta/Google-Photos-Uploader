@@ -28,6 +28,8 @@ class ConfigurationTests(unittest.TestCase):
     def test_defaults_preserve_originals_and_hide_credentials_in_repr(self):
         config = Config.from_env(self.env)
         self.assertFalse(config.delete_after_upload)
+        self.assertEqual(config.upload_threads, 2)
+        self.assertEqual(config.upload_batch_size, 4)
         self.assertNotIn('fake-token', repr(config))
         self.assertTrue(config.state_dir.is_dir())
 
@@ -75,7 +77,33 @@ class ConfigurationTests(unittest.TestCase):
         original = Config.from_env(self.env).state_scope
         refreshed = Config.from_env({**self.env, 'AUTH_DATA': FAKE_AUTH.replace('fake-token', 'new-token')})
         self.assertEqual(original, refreshed.state_scope)
+        tuned = Config.from_env({**self.env, 'UPLOAD_THREADS': '4', 'UPLOAD_BATCH_SIZE': '8'})
+        self.assertEqual(original, tuned.state_scope)
         other_account = Config.from_env({**self.env, 'AUTH_DATA': FAKE_AUTH.replace('test%40', 'other%40')})
         self.assertNotEqual(original, other_account.state_scope)
         deletion = Config.from_env({**self.env, 'DELETE_AFTER_UPLOAD': 'true'})
         self.assertNotEqual(original, deletion.state_scope)
+
+    def test_upload_concurrency_and_batch_size_bounds_are_validated(self):
+        low = Config.from_env({**self.env, 'UPLOAD_THREADS': '1', 'UPLOAD_BATCH_SIZE': '1'})
+        self.assertEqual((low.upload_threads, low.upload_batch_size), (1, 1))
+        high = Config.from_env({**self.env, 'UPLOAD_THREADS': '8', 'UPLOAD_BATCH_SIZE': '64'})
+        self.assertEqual((high.upload_threads, high.upload_batch_size), (8, 64))
+
+        for option, value in [
+            ('UPLOAD_THREADS', '0'),
+            ('UPLOAD_THREADS', '-2'),
+            ('UPLOAD_THREADS', '1.5'),
+            ('UPLOAD_THREADS', '9'),
+            ('UPLOAD_THREADS', 'abc'),
+            ('UPLOAD_THREADS', True),
+            ('UPLOAD_BATCH_SIZE', '0'),
+            ('UPLOAD_BATCH_SIZE', '-4'),
+            ('UPLOAD_BATCH_SIZE', '4.5'),
+            ('UPLOAD_BATCH_SIZE', '65'),
+            ('UPLOAD_BATCH_SIZE', ''),
+            ('UPLOAD_BATCH_SIZE', True),
+        ]:
+            with self.subTest(option=option, value=value):
+                with self.assertRaises(ValueError):
+                    Config.from_env({**self.env, option: value})
